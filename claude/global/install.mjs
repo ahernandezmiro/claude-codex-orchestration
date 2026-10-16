@@ -7,6 +7,11 @@
 //   node claude/global/install.mjs --uninstall   remove everything this installer added, except run/telemetry data
 //   node claude/global/install.mjs --uninstall --purge   also delete runs/ and telemetry/
 //
+// Install and update are the same operation: the managed folders under ~/.claude/orchestration
+// (MANAGED_DIRS) are deleted and re-copied from the kit, so files removed from the kit disappear
+// too. runs/ and telemetry/ are never touched. Normally invoked through deploy.ps1 / deploy.sh
+// at the repo root, which add the Node version and prompt-freeze checks.
+//
 // See claude/GLOBAL_INSTALL.md for the manual, step-by-step equivalent.
 
 import fs from "node:fs";
@@ -25,7 +30,8 @@ const SETTINGS = path.join(CLAUDE_HOME, "settings.json");
 const BEGIN = "<!-- BEGIN frontier-orchestration (managed by frontier_model_orchestration/claude/global/install.mjs) -->";
 const END = "<!-- END frontier-orchestration -->";
 const AGENT_FILES = ["luna-worker.md", "astra-reviewer.md"];
-const REQUIRED_MODELS = ["gpt-6-luna", "gpt-6-astra", "gpt-6-sol"];
+// Everything under DEST that the kit owns; runs/ and telemetry/ are user data and excluded.
+const MANAGED_DIRS = ["shared", "codex", "claude", "scripts", "templates", "config"];
 
 const args = new Set(process.argv.slice(2));
 const DRY = args.has("--dry-run");
@@ -87,7 +93,7 @@ function preflight() {
     const data = JSON.parse(fs.readFileSync(cache, "utf8"));
     slugs = (data.models ?? data).map((m) => m.slug);
   } catch { /* cache missing until Codex has run once */ }
-  for (const model of REQUIRED_MODELS) {
+  for (const model of configuredModels(check)) {
     check(`model id ${model}`, slugs.includes(model), slugs.length ? "" : "models_cache.json not readable; run codex once");
   }
   const wrapper = path.join(HERE, "scripts", "codex-delegate.mjs");
@@ -98,15 +104,34 @@ function preflight() {
   return ok;
 }
 
+/**
+ * List the distinct model ids the kit's config selects, using the kit's own wrapper so the
+ * models.json + models.local.json merge rules live in one place.
+ * Input: the preflight `check` reporter (used to flag an invalid config).
+ * Output: array of model id strings (empty when the config is invalid).
+ */
+function configuredModels(check) {
+  const wrapper = path.join(HERE, "scripts", "codex-delegate.mjs");
+  const r = spawnSync(process.execPath, [wrapper, "models", "--json"], { encoding: "utf8" });
+  check("model config (config/models.json + models.local.json)", r.status === 0, (r.status === 0 ? "" : r.stderr || r.stdout).trim());
+  if (r.status !== 0) return [];
+  return [...new Set(Object.values(JSON.parse(r.stdout).roles).map((role) => role.model))];
+}
+
 function install() {
+  act(`remove previously installed kit files -> ${DEST}/{${MANAGED_DIRS.join(",")}} (runs/ and telemetry/ kept)`, () => {
+    for (const dir of MANAGED_DIRS) fs.rmSync(path.join(DEST, dir), { recursive: true, force: true });
+  });
   act(`copy kit docs -> ${DEST}/{shared,codex,claude}`, () => {
     copyDir(path.join(KIT, "shared"), path.join(DEST, "shared"));
     copyDir(path.join(KIT, "codex"), path.join(DEST, "codex"));
     copyDir(path.join(KIT, "claude"), path.join(DEST, "claude"), (e) => e.isFile() && e.name.endsWith(".md"));
   });
-  act(`copy wrapper + templates -> ${DEST}/{scripts,templates}`, () => {
+  act(`copy wrapper + templates + model config -> ${DEST}/{scripts,templates,config}`, () => {
     copyDir(path.join(HERE, "scripts"), path.join(DEST, "scripts"));
     copyDir(path.join(HERE, "templates"), path.join(DEST, "templates"));
+    // models.local.json is copied only when this machine's checkout has one (it is gitignored).
+    copyDir(path.join(HERE, "config"), path.join(DEST, "config"), (e) => e.isFile() && e.name.endsWith(".json"));
     fs.mkdirSync(path.join(DEST, "runs"), { recursive: true });
     fs.mkdirSync(path.join(DEST, "telemetry"), { recursive: true });
   });
@@ -137,6 +162,32 @@ function install() {
     }
     writeJson(SETTINGS, settings);
   });
+  act(`record deployed kit version -> ${path.join(DEST, "deployed.json")}`, () => {
+    writeJson(path.join(DEST, "deployed.json"), deploymentRecord());
+  });
+}
+
+/**
+ * Describe what is being deployed, so each machine can report which kit version it runs.
+ * Input: none (reads the kit's git checkout and the installed model config).
+ * Output: { commit, dirty, deployed_at, host, platform, models } — commit/dirty are null
+ * when the kit is not a git checkout.
+ */
+function deploymentRecord() {
+  const gitOut = (gitArgs) => {
+    const r = spawnSync("git", ["-C", KIT, ...gitArgs], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : null;
+  };
+  const commit = gitOut(["rev-parse", "HEAD"]);
+  const models = spawnSync(process.execPath, [path.join(DEST, "scripts", "codex-delegate.mjs"), "models", "--json"], { encoding: "utf8" });
+  return {
+    commit,
+    dirty: commit ? gitOut(["status", "--porcelain"]) !== "" : null,
+    deployed_at: new Date().toISOString(),
+    host: os.hostname(),
+    platform: process.platform,
+    models: models.status === 0 ? JSON.parse(models.stdout).roles : null
+  };
 }
 
 function uninstall() {

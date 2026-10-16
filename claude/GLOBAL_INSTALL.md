@@ -37,25 +37,31 @@ you ──► Claude Code (Opus, orchestrator)
 
 All roles use reasoning effort `high` (the companion accepts at most `xhigh`; override per run with `--effort`).
 
+The table shows the original values. Since the kit moved to the `orchestration-kit` repo, the model and default effort per role come from `claude/global/config/models.json` (installed to `~/.claude/orchestration/config/`), with an optional per-machine `models.local.json`. Run `node ~/.claude/orchestration/scripts/codex-delegate.mjs models` to see the effective selection. Every run record stores the `model` and `effort` actually used.
+
 ---
 
 ## 2. Quick path
 
-```bash
-node claude/global/install.mjs --check
+Use the deploy script at the repo root. It checks Node, runs the prompt-freeze guard, then calls `install.mjs`. Fresh installs and updates are the same command.
+
+```powershell
+.\deploy.ps1 -Check
 ```
-```bash
-node claude/global/install.mjs
+```powershell
+.\deploy.ps1
 ```
+On Linux/WSL: `./deploy.sh --check`, then `./deploy.sh`.
 
 Then **start a new Claude Code session**. Agents and `CLAUDE.md` only load at session start. Run the validation in section 6.
 
-Other installer modes:
-- `--dry-run` shows what would change.
-- `--uninstall` removes everything the installer added (with backups), but keeps `~/.claude/orchestration/runs/` and `telemetry/`.
-- `--uninstall --purge` also deletes that data.
+Other modes (`deploy.ps1` switch / `deploy.sh` flag):
+- `-DryRun` / `--dry-run` shows what would change.
+- `-Uninstall` / `--uninstall` removes everything the installer added (with backups), but keeps `~/.claude/orchestration/runs/` and `telemetry/`.
+- `-Uninstall -Purge` / `--uninstall --purge` also deletes that data.
+- `-AllowPromptChange` / `--allow-prompt-change` skips the prompt-freeze guard (only after the evaluation is closed).
 
-The installer is idempotent; re-run it after editing anything under `claude/global/`.
+Each deploy deletes and re-copies the kit-managed folders under `~/.claude/orchestration` (`shared, codex, claude, scripts, templates, config`), so files removed from the kit disappear too. It also writes `deployed.json` with the commit and effective models.
 
 ---
 
@@ -149,14 +155,17 @@ claude/global/install.mjs                ← installer (--check | --dry-run | --
 claude/global/CLAUDE.orchestration.md
 claude/global/settings.permissions.json
 claude/global/scripts/codex-delegate.mjs
+claude/global/config/models.json         ← model + default effort per role (models.local.json: per-machine, gitignored)
 claude/global/agents/{luna-worker,astra-reviewer}.md
 claude/global/templates/{task-packet,review-packet}.yaml
 claude/global/test/create-playground.mjs
-claude/global/test/{T001-slugify,T002-forbidden-git,R001-slug-registry}.yaml
+claude/global/test/{T001-slugify,T002-forbidden-git,R001-slug-registry,I001-investigate}.yaml
+claude/global/test/prompt-freeze.mjs     ← prompt-freeze guard; golden/ holds the baseline prompts
+deploy.ps1, deploy.sh                    ← repo root: deploy (install/update) on Windows / Linux-WSL
 playground/                              ← disposable test repo from the first machine; don't copy it
 ```
 
-Edit files under `claude/global/` (the source of truth) and re-run the installer. Don't edit the installed copies.
+Edit files in the repo (the source of truth), commit, then run the deploy script on each machine. Don't edit the installed copies; the next deploy overwrites them.
 
 ---
 
@@ -165,7 +174,8 @@ Edit files under `claude/global/` (the source of truth) and re-run the installer
 | Preflight failure | Fix |
 |---|---|
 | `codex CLI on PATH` / `codex logged in` | Install Codex and run `codex login` (manual: user's subscription) |
-| `model id gpt-6-…` missing | Check `~/.codex/models_cache.json` (`models[].slug`). Update `ROLES` in `claude/global/scripts/codex-delegate.mjs`, `REQUIRED_MODELS` in `install.mjs` and the table in `CLAUDE.orchestration.md`, then re-run the installer |
+| `model id …` missing | Check `~/.codex/models_cache.json` (`models[].slug`). The cache lists models a newer CLI may still reject, so confirm with `codex exec --skip-git-repo-check --sandbox read-only --model <id> "Reply OK"`. Then change `claude/global/config/models.json` (all machines: commit and push) or `models.local.json` (this machine only), and redeploy. The preflight reads the required ids from that config |
+| `model config` | `models.json` / `models.local.json` is invalid (bad JSON, unknown role, missing model, effort outside `none…xhigh`); the message names the file and role |
 | OpenAI `codex` Claude plugin not found | Install OpenAI's `codex` plugin (codex-plugin-cc) in Claude Code / the desktop app (manual). If it lives somewhere unusual, set the env var `CODEX_COMPANION` to the full path of `codex-companion.mjs` |
 | `codex mcp-server available` | Codex Dispatch could work. Add the server to Claude's MCP config only if the user wants it; the wrapper doesn't need it |
 | Not Windows | Nothing to change. The wrapper and installer are cross-platform Node; the `PowerShell(...)` permission rules are simply unused |
