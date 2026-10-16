@@ -1,0 +1,10 @@
+{
+  "_description": "Model id and default reasoning effort per delegation role, read by codex-delegate.mjs at run time. Shared across machines: edit, commit, push, pull, deploy. Per-machine overrides go in models.local.json (gitignored, same shape, any subset of roles/fields). Valid efforts: none, minimal, low, medium, high, xhigh. Roles themselves (prompts, sandbox, contracts) are defined in scripts/codex-delegate.mjs and are not configurable here. Author: maintained with Claude Code for the frontier-model orchestration setup.",
+  "roles": {
+    "luna-implement": { "model": "gpt-6-luna", "effort": "high" },
+    "luna-test": { "model": "gpt-6-luna", "effort": "high" },
+    "sol-implement": { "model": "gpt-6-sol", "effort": "high" },
+    "astra-review": { "model": "gpt-6-astra", "effort": "high" },
+    "astra-investigate": { "model": "gpt-6-astra", "effort": "high" }
+  }
+}

@@ -12,6 +12,7 @@
 //   node codex-delegate.mjs cancel [job-id]
 //   node codex-delegate.mjs verify-git <baseline.json>
 //   node codex-delegate.mjs which
+//   node codex-delegate.mjs models [--json]   // effective model/effort per role and the config files used
 //
 // Added observability commands:
 //   node codex-delegate.mjs runs [--json] [--limit <n>] [--role <role>] [--status <status>]
@@ -31,7 +32,8 @@
 //   --max-attempts <n>    // hard stop for this budget bucket
 //
 // Notes:
-// - Roles still fix model/sandbox/contract; callers cannot override model.
+// - Roles still fix model/sandbox/contract; callers cannot override model. The model and default
+//   effort per role come from ../config/models.json (+ optional models.local.json), not this file.
 // - Foreground companion output is captured AND mirrored to the terminal.
 // - Background jobs are still delegated to the companion. Submission records the companion job id;
 //   `collect` later reads `codex-companion result <job> --json` and finalizes the run (status, timing, git guard).
@@ -48,32 +50,40 @@ const RUNS_DIR = path.join(KIT_ROOT, "runs");
 const TELEMETRY_DIR = path.join(KIT_ROOT, "telemetry");
 const EVENTS_FILE = path.join(TELEMETRY_DIR, "events.jsonl");
 const SKIPS_FILE = path.join(TELEMETRY_DIR, "routing-skips.jsonl");
+// Model and effort per role live in config/, not here, so they can change without touching
+// role definitions or prompts. models.local.json (optional, per machine) overrides models.json.
+const MODEL_CONFIG_FILES = [
+  path.join(KIT_ROOT, "config", "models.json"),
+  path.join(KIT_ROOT, "config", "models.local.json")
+];
 
+// `worker` is prompt text ("You are <worker>…"), frozen for the evaluation period; it is
+// deliberately independent of the configured model id.
 const ROLES = {
   "luna-implement": {
-    model: "gpt-6-luna", effort: "high", write: true, worker: "GPT-6 Luna",
+    write: true, worker: "GPT-6 Luna",
     roleDoc: "codex/ROLE_LUNA_IMPLEMENT.md", contract: "task",
     required: ["id", "objective", "editable_paths", "acceptance_criteria"]
   },
   "luna-test": {
-    model: "gpt-6-luna", effort: "high", write: true, worker: "GPT-6 Luna",
+    write: true, worker: "GPT-6 Luna",
     roleDoc: "codex/ROLE_LUNA_TEST.md", contract: "task",
     required: ["id", "objective", "acceptance_criteria"]
   },
   "sol-implement": {
-    model: "gpt-6-sol", effort: "high", write: true, worker: "GPT-6 Sol",
+    write: true, worker: "GPT-6 Sol",
     roleDoc: "codex/ROLE_LUNA_IMPLEMENT.md", contract: "task",
     required: ["id", "objective", "editable_paths", "acceptance_criteria"]
   },
   "astra-review": {
-    model: "gpt-6-astra", effort: "high", write: false, worker: "GPT-6 Astra",
+    write: false, worker: "GPT-6 Astra",
     roleDoc: "codex/ROLE_ASTRA_REVIEW.md", contract: "review",
     required: ["id", "requirements", "artifact"],
     // Blind review: anything outside these keys (rationale, reasoning, discussion...) is stripped.
     allowed: ["id", "role", "requirements", "constraints", "context", "artifact", "focus", "out_of_scope"]
   },
   "astra-investigate": {
-    model: "gpt-6-astra", effort: "high", write: false, worker: "GPT-6 Astra",
+    write: false, worker: "GPT-6 Astra",
     roleDoc: "codex/ROLE_ASTRA_INVESTIGATE.md", contract: "result",
     required: ["id", "objective"]
   }
@@ -82,6 +92,37 @@ const ROLES = {
 const VALID_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const VALID_OUTCOMES = ["accepted", "minor_rework", "major_rework", "failed", "not_applicable"];
 const VALID_USEFULNESS = ["yes", "no", "mixed"];
+
+/**
+ * Resolve the model and default effort for every role from config/models.json, with
+ * config/models.local.json overriding individual fields when present.
+ * Input: none (reads MODEL_CONFIG_FILES).
+ * Output: { selection: { <role>: { model, effort } }, sources: [files read] }.
+ * Fails (exit 2) on a missing base file, invalid JSON, unknown role, or a role left
+ * without a model or with an invalid effort — never falls back to a stale default.
+ */
+function loadModelSelection() {
+  const [baseFile] = MODEL_CONFIG_FILES;
+  if (!fs.existsSync(baseFile)) fail(`model config not found: ${baseFile} (re-run the deploy script)`);
+  const selection = Object.fromEntries(Object.keys(ROLES).map((name) => [name, {}]));
+  const sources = [];
+  for (const file of MODEL_CONFIG_FILES.filter((f) => fs.existsSync(f))) {
+    let config;
+    try { config = JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { fail(`invalid JSON in ${file}: ${e.message}`); }
+    for (const [roleName, values] of Object.entries(config.roles ?? {})) {
+      if (!ROLES[roleName]) fail(`${file}: unknown role '${roleName}' (roles: ${Object.keys(ROLES).join(", ")})`);
+      for (const key of ["model", "effort"]) {
+        if (values?.[key] != null) selection[roleName][key] = values[key];
+      }
+    }
+    sources.push(file);
+  }
+  for (const [roleName, { model, effort }] of Object.entries(selection)) {
+    if (!model || typeof model !== "string") fail(`no model configured for role '${roleName}' in ${sources.join(" + ")}`);
+    if (!VALID_EFFORTS.includes(effort)) fail(`role '${roleName}' effort must be one of: ${VALID_EFFORTS.join(", ")} (got ${JSON.stringify(effort)})`);
+  }
+  return { selection, sources };
+}
 
 function ensureDirs() {
   fs.mkdirSync(RUNS_DIR, { recursive: true });
@@ -405,7 +446,8 @@ function cmdRun(options) {
   if (!fs.existsSync(packetPath)) fail(`packet not found: ${packetPath}`);
   const cwd = path.resolve(options.cwd || process.cwd());
   if (!fs.existsSync(cwd)) fail(`--cwd does not exist: ${cwd}`);
-  const effort = options.effort || role.effort;
+  const { model, effort: configuredEffort } = loadModelSelection().selection[roleName];
+  const effort = options.effort || configuredEffort;
   if (!VALID_EFFORTS.includes(effort)) fail(`--effort must be one of: ${VALID_EFFORTS.join(", ")}`);
 
   let blocks = splitTopLevel(fs.readFileSync(packetPath, "utf8"));
@@ -438,7 +480,7 @@ function cmdRun(options) {
   const baseline = gitSnapshot(cwd);
   writeJson(baselineFile, baseline);
 
-  const args = ["task", "--cwd", cwd, "--model", role.model, "--effort", effort, "--prompt-file", promptFile, "--fresh"];
+  const args = ["task", "--cwd", cwd, "--model", model, "--effort", effort, "--prompt-file", promptFile, "--fresh"];
   if (role.write) args.push("--write");
   if (options.background) args.push("--background");
 
@@ -452,7 +494,7 @@ function cmdRun(options) {
     parent: options.parent || null,
     role: roleName,
     worker: role.worker,
-    model: role.model,
+    model,
     effort,
     sandbox: role.write ? "workspace-write" : "read-only",
     cwd,
@@ -486,7 +528,7 @@ function cmdRun(options) {
   saveRun(run, "run_started");
 
   console.log(`DELEGATE: run=${run.run_id}`);
-  console.log(`DELEGATE: role=${roleName} model=${role.model} effort=${effort} sandbox=${run.sandbox} cwd=${cwd}`);
+  console.log(`DELEGATE: role=${roleName} model=${model} effort=${effort} sandbox=${run.sandbox} cwd=${cwd}`);
   if (run.reason) console.log(`DELEGATE: reason=${run.reason}`);
   console.log(`DELEGATE: prompt=${promptFile}`);
 
@@ -800,6 +842,15 @@ switch (command) {
   case "which":
     console.log(findCompanion());
     process.exit(0);
+  case "models": {
+    const { selection, sources } = loadModelSelection();
+    if (options.json) console.log(JSON.stringify({ sources, roles: selection }, null, 2));
+    else {
+      console.log(`config: ${sources.join(" + ")}`);
+      for (const [roleName, { model, effort }] of Object.entries(selection)) console.log(`${roleName}\t${model}\t${effort}`);
+    }
+    process.exit(0);
+  }
   case "runs":
     process.exit(cmdRuns(options));
   case "show":
@@ -819,6 +870,7 @@ switch (command) {
       "  status|result|cancel [job-id] [--cwd <dir>] [--wait] [--timeout-ms <ms>]",
       "  verify-git <baseline.json>",
       "  which",
+      "  models [--json]",
       "  runs [--json] [--limit <n>] [--role <role>] [--status <status>]",
       "  show <run-id-or-json-path> [--json]",
       "  assess <run-id-or-json-path> --outcome <accepted|minor_rework|major_rework|failed|not_applicable> [--useful <yes|no|mixed>] [--findings <n>] [--accepted-findings <n>] [--rework-rounds <n>] [--notes <text>]",
