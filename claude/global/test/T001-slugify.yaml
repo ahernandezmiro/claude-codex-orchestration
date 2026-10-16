@@ -1,0 +1,37 @@
+id: T001-slugify
+role: implement
+objective: >-
+  Add an exported function slugify(input) to playground src/strings.js with unit tests.
+
+context:
+  files: [src/strings.js, test/strings.test.js, package.json]
+
+editable_paths: [src/strings.js, test/strings.test.js]
+read_only_paths: [package.json]
+
+constraints:
+  - No new dependencies; plain ES modules, Node built-ins only.
+  - Keep capitalize() unchanged.
+  - Do not commit, push, merge, or touch git history.
+
+acceptance_criteria:
+  - slugify("Hello, World!") === "hello-world"
+  - slugify("  Multiple   spaces  ") === "multiple-spaces"
+  - slugify("Crème Brûlée") === "creme-brulee" (diacritics stripped via Unicode NFKD normalization)
+  - slugify("a--b__c") === "a-b-c" (runs of non-alphanumerics collapse to one hyphen; no leading/trailing hyphens)
+  - slugify("") === ""
+  - slugify throws TypeError for non-string input
+  - Each criterion above has a test in test/strings.test.js
+
+required_checks:
+  - node --test
+
+out_of_scope:
+  - Any other file
+  - Transliteration of non-Latin scripts
+
+output:
+  summary: true
+  files_changed: true
+  tests_run: true
+  unresolved_issues: true

@@ -1,0 +1,8 @@
+# Line-ending policy for the orchestration kit.
+# Author: maintained with Claude Code for the frontier-model orchestration setup.
+#
+# Why: codex-delegate.mjs inlines the role docs and contracts byte-for-byte into the
+# worker prompt. With core.autocrlf=true (Git for Windows default) a checkout would turn
+# LF into CRLF and silently change every delegated prompt. Force LF on every machine.
+* text=auto eol=lf
+*.ps1 text eol=crlf

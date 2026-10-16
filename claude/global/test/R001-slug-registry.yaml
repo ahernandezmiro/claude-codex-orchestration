@@ -1,0 +1,17 @@
+id: R001-slug-registry
+role: review
+requirements: >-
+  Blog posts need URL slugs that are unique within one site build. Titles may repeat.
+  Slugs must be stable across rebuilds when the set of posts does not change.
+constraints:
+  - Plain ES modules, no dependencies.
+  - Must reuse slugify() from src/strings.js.
+context:
+  files: [src/strings.js]
+artifact:
+  path: docs/slug-registry-proposal.md
+focus:
+  - requirements coverage
+  - hidden assumptions and failure modes
+rationale: >-
+  OPUS-PRIVATE-REASONING-CANARY: I chose a singleton because I think it is simplest.

@@ -1,0 +1,30 @@
+id: short-unique-id
+role: implement            # implement | test
+objective: >-
+  One concrete outcome.
+
+context:
+  files: []
+  docs: []
+
+editable_paths: []
+read_only_paths: []
+
+constraints:
+  - Do not add dependencies.
+  - Do not commit, push, merge, or touch git history.
+
+acceptance_criteria:
+  - observable condition
+
+required_checks:
+  - command to run
+
+out_of_scope:
+  - explicitly excluded work
+
+output:
+  summary: true
+  files_changed: true
+  tests_run: true
+  unresolved_issues: true

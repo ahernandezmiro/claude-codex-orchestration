@@ -1,0 +1,21 @@
+# Blind review packet for astra-review. Only these keys are sent:
+# id, role, requirements, constraints, context, artifact, focus, out_of_scope.
+# Any other key (rationale, reasoning, notes...) is stripped by the wrapper.
+id: short-unique-id
+role: review
+requirements: >-
+  The original requirements, as the user stated them.
+
+constraints:
+  - explicit constraint
+
+context:
+  files: []                # paths relative to --cwd that Astra may read
+
+artifact:
+  path: path/to/proposal-or-file   # relative to --cwd; or paste the proposal inline below
+  # inline: |
+  #   ...
+
+focus:
+  - optional review dimension to emphasize (neutral phrasing, no author opinion)

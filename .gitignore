@@ -1,0 +1,46 @@
+# Files that must never be tracked in the orchestration kit repo.
+# Author: maintained with Claude Code for the frontier-model orchestration setup.
+# Only setup sources (prompts, roles, scripts, templates, shared config) belong here.
+
+# --- Per-machine model/effort override (see README "Model configuration") ---
+claude/global/config/models.local.json
+
+# --- Delegation runs and telemetry (written next to the wrapper's kit root) ---
+runs/
+telemetry/
+*.run.json
+*.prompt.md
+*.stdout.txt
+*.stderr.txt
+*.git-baseline.json
+*.jsonl
+
+# --- Orchestration work products created inside target projects ---
+.orchestration/
+
+# --- Validation repos created by claude/global/test/create-playground.mjs ---
+playground/
+orch-playground/
+
+# --- Claude Code / Codex conversation and session state ---
+.claude/
+.codex/
+CLAUDE.local.md
+*.transcript.*
+history.jsonl
+
+# --- Installer backups and scratch ---
+*.bak-*
+*.tmp
+*.log
+tmp/
+
+# --- Tooling / OS noise ---
+node_modules/
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
