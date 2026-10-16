@@ -1,0 +1,14 @@
+id: I001-registry-collisions
+role: investigate
+objective: >-
+  Explain why two callers of the slug registry proposal in docs/slug-registry-proposal.md
+  could receive the same slug, and propose a repair plan.
+
+context:
+  files: [docs/slug-registry-proposal.md, src/strings.js]
+
+constraints:
+  - Read-only investigation; do not edit files.
+
+out_of_scope:
+  - Implementing the fix
