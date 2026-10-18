@@ -14,12 +14,14 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 | `shared/`, `codex/`, `claude/*.md` | policy, contracts and role docs (prompt text) | `~/.claude/orchestration/{shared,codex,claude}/` |
 | `claude/global/scripts/codex-delegate.mjs` | delegation wrapper: roles, prompt assembly, git guard, telemetry | `~/.claude/orchestration/scripts/` |
 | `claude/global/config/models.json` | **model + default effort per role** | `~/.claude/orchestration/config/` |
+| `claude/global/config/quota.json` | **quota-gate threshold per role** | same |
+| `claude/global/scripts/quota-gate.mjs` | Codex quota read + gate, used by the wrapper | `~/.claude/orchestration/scripts/` |
 | `claude/global/config/models.local.json` | optional per-machine override (gitignored) | same, if present |
 | `claude/global/agents/*.md` | `luna-worker`, `astra-reviewer` subagents | `~/.claude/agents/` |
 | `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | managed block in `~/.claude/CLAUDE.md` |
 | `claude/global/settings.permissions.json` | allow/ask rules | merged into `~/.claude/settings.json` |
 | `claude/global/install.mjs` | cross-platform installer | — |
-| `claude/global/test/` | validation packets, playground creator, prompt-freeze guard + golden prompts | — |
+| `claude/global/test/` | validation packets, playground creator, prompt-freeze guard + golden prompts, quota-gate tests | — |
 | `deploy.ps1` / `deploy.sh` | deploy entry points for Windows / Linux-WSL | — |
 
 ## Deploy (fresh install or update)
@@ -73,6 +75,29 @@ What a deploy does:
 - **Check the model works first.** The Codex cache can list models your account or CLI still rejects. Before switching, run `codex exec --skip-git-repo-check --sandbox read-only --model <id> "Reply OK"`.
 
 Roles themselves (prompt, sandbox, contract, required packet keys, blind-review allowlist) stay in `codex-delegate.mjs` and are not configurable. In particular, the worker display name in the prompt ("You are GPT-6 Luna…") is part of the frozen prompt and does not follow the model id.
+
+## Quota gate
+
+Every real `run` (not `--dry-run`) checks Codex quota before it delegates, so a worker doesn't start and then stop with partial or empty results. The check is a script, so the orchestrator doesn't decide anything: the call either goes ahead or exits with code **5** before any Codex work starts.
+
+How it works:
+1. It reads the 5h window (`window_minutes: 300`) from a short-lived `codex app-server` (`account/rateLimits/read`, the numbers `/status` shows; about 2–3 s). If that fails, it uses the newest `rate_limits` snapshot in `~/.codex/sessions` rollouts, as long as that window hasn't reset. If neither gives a value, the run is blocked.
+2. It reserves quota for runs still in flight: runs recorded as `running` or `submitted_background` that started within the last window. Each one reserves its role's number from `config/quota.json`.
+3. It allows the run only if `(100 − used%) − reservations − this role's number > 0`.
+
+| Role | Threshold = reservation |
+|---|---|
+| `astra-review`, `astra-investigate` | 25 |
+| `sol-implement` | 15 |
+| `luna-implement`, `luna-test` | 10 |
+
+Example: 60% remaining with one Astra and one Luna in flight leaves 60 − 25 − 10 = 25%. Astra (needs more than 25) is blocked; Sol and Luna are allowed.
+
+- A blocked call prints `QUOTA GATE: BLOCKED …`, writes a `quota_gate_blocked` event to `telemetry/events.jsonl` and creates no run record. An allowed call stores the verdict in the run record as `quota_gate`.
+- `codex-delegate.mjs quota [--role <role>] [--json]` shows the current verdict for each role.
+- Uncollected background runs keep their reservation until they are collected or a window has passed. Run `collect` promptly.
+- Environment variables: `CODEX_BIN` sets the codex binary. `CODEX_QUOTA_SNAPSHOT=<file.json>` (`{usedPercent, windowMinutes, resetsAt}`) replaces the live read; the tests use it.
+- Tests: `node --test claude/global/test/quota-gate.test.mjs`.
 
 ## Prompt freeze (evaluation period)
 

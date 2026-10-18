@@ -1,0 +1,12 @@
+{
+  "_description": "Codex quota gate read by codex-delegate.mjs before every non-dry-run delegation. Each role's number is both its threshold and the quota it reserves while it runs. A run is allowed only if (100 - used% of the window) - sum(reservations of ongoing runs) - this role's number > 0. Ongoing = runs recorded as running or submitted_background that started within the last window. Shared across machines: edit, commit, push, pull, deploy. Author: maintained with Claude Code for the frontier-model orchestration setup.",
+  "window_minutes": 300,
+  "read_timeout_ms": 20000,
+  "roles": {
+    "astra-review": 25,
+    "astra-investigate": 25,
+    "sol-implement": 15,
+    "luna-implement": 10,
+    "luna-test": 10
+  }
+}

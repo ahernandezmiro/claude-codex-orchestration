@@ -13,6 +13,10 @@
 //   node codex-delegate.mjs verify-git <baseline.json>
 //   node codex-delegate.mjs which
 //   node codex-delegate.mjs models [--json]   // effective model/effort per role and the config files used
+//   node codex-delegate.mjs quota [--role <role>] [--json]   // Codex window usage and quota-gate verdict per role
+//
+// Quota gate: every non-dry-run `run` first checks config/quota.json against the Codex rate-limit
+// window (see quota-gate.mjs) and exits 5 without delegating when quota is insufficient or unknown.
 //
 // Added observability commands:
 //   node codex-delegate.mjs runs [--json] [--limit <n>] [--role <role>] [--status <status>]
@@ -44,6 +48,9 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  QUOTA_BLOCKED_EXIT_CODE, loadQuotaRules, readQuotaSnapshot, ongoingReservations, evaluateQuotaGate, formatGateLine
+} from "./quota-gate.mjs";
 
 const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS_DIR = path.join(KIT_ROOT, "runs");
@@ -56,6 +63,7 @@ const MODEL_CONFIG_FILES = [
   path.join(KIT_ROOT, "config", "models.json"),
   path.join(KIT_ROOT, "config", "models.local.json")
 ];
+const QUOTA_CONFIG_FILE = path.join(KIT_ROOT, "config", "quota.json");
 
 // `worker` is prompt text ("You are <worker>…"), frozen for the evaluation period; it is
 // deliberately independent of the configured model id.
@@ -437,7 +445,60 @@ function enforceBudget({ options, taskId, roleName }) {
   }
 }
 
-function cmdRun(options) {
+/**
+ * Quota gate for one role: current window usage minus reservations of ongoing runs.
+ * Input: role name. Output: Promise<{ decision, snapshot, ongoing, errors }>.
+ * Exits 2 on an invalid config/quota.json (same as a bad model config).
+ */
+async function checkQuota(roleName) {
+  let rules;
+  try { rules = loadQuotaRules(QUOTA_CONFIG_FILE, Object.keys(ROLES)); } catch (e) { fail(e.message); }
+  const { snapshot, errors } = await readQuotaSnapshot(rules);
+  const ongoing = ongoingReservations(readAllRuns(), rules);
+  return { decision: evaluateQuotaGate({ role: roleName, snapshot, ongoing, rules }), snapshot, ongoing, errors };
+}
+
+/**
+ * Apply the quota gate before a real delegation. Blocks with exit code 5 and a
+ * `quota_gate_blocked` telemetry event; no run record is created for a blocked call.
+ * Input: role name, task id. Output: Promise<gate record to store on the run>.
+ */
+async function enforceQuota(roleName, taskId) {
+  const { decision, snapshot, ongoing, errors } = await checkQuota(roleName);
+  for (const e of errors) console.log(`QUOTA GATE: source error — ${e}`);
+  console.log(formatGateLine(decision, snapshot, ongoing));
+  const record = { ...decision, used_percent: snapshot?.usedPercent ?? null, resets_at: snapshot?.resetsAt ?? null,
+    source: snapshot?.source ?? null, ongoing_run_ids: ongoing.map((r) => r.run_id) };
+  if (!decision.allowed) {
+    appendJsonl(EVENTS_FILE, { ts: nowIso(), type: "quota_gate_blocked", task_id: taskId, role: roleName, quota_gate: record });
+    console.log("QUOTA GATE: delegation skipped. Do not retry now; do the work without this worker or wait for the window to reset.");
+    process.exit(QUOTA_BLOCKED_EXIT_CODE);
+  }
+  return record;
+}
+
+/**
+ * `quota` command: show window usage, ongoing reservations and the gate verdict per role.
+ * Input: { role?, json? }. Output: Promise<exit code> — 0 if every listed role is allowed, else 5.
+ */
+async function cmdQuota(options) {
+  const roleNames = options.role ? [options.role] : Object.keys(ROLES);
+  if (options.role && !ROLES[options.role]) fail(`--role must be one of: ${Object.keys(ROLES).join(", ")}`);
+  let rules;
+  try { rules = loadQuotaRules(QUOTA_CONFIG_FILE, Object.keys(ROLES)); } catch (e) { fail(e.message); }
+  const { snapshot, errors } = await readQuotaSnapshot(rules);
+  const ongoing = ongoingReservations(readAllRuns(), rules);
+  const decisions = roleNames.map((role) => evaluateQuotaGate({ role, snapshot, ongoing, rules }));
+  if (options.json) {
+    console.log(JSON.stringify({ snapshot, errors, ongoing, decisions }, null, 2));
+  } else {
+    for (const e of errors) console.log(`source error — ${e}`);
+    for (const d of decisions) console.log(formatGateLine(d, snapshot, ongoing));
+  }
+  return decisions.every((d) => d.allowed) ? 0 : QUOTA_BLOCKED_EXIT_CODE;
+}
+
+async function cmdRun(options) {
   const roleName = options.role;
   const role = ROLES[roleName];
   if (!role) fail(`--role must be one of: ${Object.keys(ROLES).join(", ")}`);
@@ -467,6 +528,8 @@ function cmdRun(options) {
   const taskIdRaw = packetScalar(blocks, "id") || "task";
   const taskId = sanitizeId(taskIdRaw);
   enforceBudget({ options, taskId, roleName });
+  // Dry runs never reach Codex, so they neither need quota nor should depend on a live read.
+  const quotaGate = options["dry-run"] ? null : await enforceQuota(roleName, taskIdRaw);
 
   const stamp = nowIso().replace(/[:.]/g, "-");
   const base = path.join(RUNS_DIR, `${stamp}-${taskId}-${roleName}`);
@@ -510,6 +573,7 @@ function cmdRun(options) {
     budget_key: options["budget-key"] || `${taskId}:${roleName}`,
     attempt: options.attempt ? Number(options.attempt) : null,
     max_attempts: options["max-attempts"] ? Number(options["max-attempts"]) : null,
+    quota_gate: quotaGate,
     background: Boolean(options.background),
     started_at: startedAt,
     finished_at: null,
@@ -828,7 +892,9 @@ const { options, positionals } = parseArgs(rest);
 
 switch (command) {
   case "run":
-    process.exit(cmdRun(options));
+    process.exit(await cmdRun(options));
+  case "quota":
+    process.exit(await cmdQuota(options));
   case "status":
   case "result":
   case "cancel":
@@ -871,6 +937,7 @@ switch (command) {
       "  verify-git <baseline.json>",
       "  which",
       "  models [--json]",
+      "  quota [--role <role>] [--json]",
       "  runs [--json] [--limit <n>] [--role <role>] [--status <status>]",
       "  show <run-id-or-json-path> [--json]",
       "  assess <run-id-or-json-path> --outcome <accepted|minor_rework|major_rework|failed|not_applicable> [--useful <yes|no|mixed>] [--findings <n>] [--accepted-findings <n>] [--rework-rounds <n>] [--notes <text>]",

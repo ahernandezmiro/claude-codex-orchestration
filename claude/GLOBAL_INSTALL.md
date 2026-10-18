@@ -16,6 +16,7 @@ you ──► Claude Code (Opus, orchestrator)
         subagent luna-worker / astra-reviewer   (~/.claude/agents, haiku, Bash only, no conversation context)
           ▼
         node ~/.claude/orchestration/scripts/codex-delegate.mjs run --role <role> --packet <file> --cwd <repo>
+          │  • quota gate: Codex 5h window minus ongoing reservations vs config/quota.json → BLOCKED (exit 5)
           │  • role fixes model + sandbox + contract (caller can't choose the model)
           │  • astra-review: drops every packet key outside an allowlist (blind review)
           │  • builds a self-contained prompt: safety rules + role doc + contract + packet
@@ -155,12 +156,15 @@ claude/global/install.mjs                ← installer (--check | --dry-run | --
 claude/global/CLAUDE.orchestration.md
 claude/global/settings.permissions.json
 claude/global/scripts/codex-delegate.mjs
+claude/global/scripts/quota-gate.mjs     ← Codex quota read + gate (used by `run` and `quota`)
 claude/global/config/models.json         ← model + default effort per role (models.local.json: per-machine, gitignored)
+claude/global/config/quota.json          ← quota-gate threshold/reservation per role
 claude/global/agents/{luna-worker,astra-reviewer}.md
 claude/global/templates/{task-packet,review-packet}.yaml
 claude/global/test/create-playground.mjs
 claude/global/test/{T001-slugify,T002-forbidden-git,R001-slug-registry,I001-investigate}.yaml
 claude/global/test/prompt-freeze.mjs     ← prompt-freeze guard; golden/ holds the baseline prompts
+claude/global/test/quota-gate.test.mjs   ← quota gate tests (`node --test`, no Codex calls)
 deploy.ps1, deploy.sh                    ← repo root: deploy (install/update) on Windows / Linux-WSL
 playground/                              ← disposable test repo from the first machine; don't copy it
 ```
@@ -175,6 +179,7 @@ Edit files in the repo (the source of truth), commit, then run the deploy script
 |---|---|
 | `codex CLI on PATH` / `codex logged in` | Install Codex and run `codex login` (manual: user's subscription) |
 | `model id …` missing | Check `~/.codex/models_cache.json` (`models[].slug`). The cache lists models a newer CLI may still reject, so confirm with `codex exec --skip-git-repo-check --sandbox read-only --model <id> "Reply OK"`. Then change `claude/global/config/models.json` (all machines: commit and push) or `models.local.json` (this machine only), and redeploy. The preflight reads the required ids from that config |
+| `QUOTA GATE: BLOCKED … quota unknown` on every run | Neither `codex app-server` (`account/rateLimits/read`) nor a recent rollout in `~/.codex/sessions` gave a 5h window. Run `codex-delegate.mjs quota` to see the source errors; check `codex login`, or set `CODEX_BIN` if `codex` is not on PATH |
 | `model config` | `models.json` / `models.local.json` is invalid (bad JSON, unknown role, missing model, effort outside `none…xhigh`); the message names the file and role |
 | OpenAI `codex` Claude plugin not found | Install OpenAI's `codex` plugin (codex-plugin-cc) in Claude Code / the desktop app (manual). If it lives somewhere unusual, set the env var `CODEX_COMPANION` to the full path of `codex-companion.mjs` |
 | `codex mcp-server available` | Codex Dispatch could work. Add the server to Claude's MCP config only if the user wants it; the wrapper doesn't need it |
@@ -211,6 +216,7 @@ Expect:
 **E. Telemetry.**
 - In the A run's `show` output, the first changed file should read `src/strings.js` (not `rc/strings.js`). If the playground already had an untracked file, it should appear in `dirty_before`.
 - Attempt budget: re-run A with `--budget-key t:impl --max-attempts 1 --dry-run` after a real run that used the same key. Expect exit 4 and `orchestration budget exceeded`.
+- Quota gate: `node ~/.claude/orchestration/scripts/codex-delegate.mjs quota` should print `source=live` and one verdict per role. `node --test claude/global/test/quota-gate.test.mjs` covers thresholds, reservations and exit 5 without calling Codex.
 - `assess <run-id> --outcome accepted --useful yes ...`, `record-skip --task-id x --reason y`, `runs` and `metrics` should all succeed.
 - Afterwards, move the validation records out of the evaluation window: put the files in `~/.claude/orchestration/runs/` into `runs/_validation/` and those in `telemetry/` into `telemetry/_validation/`.
 
