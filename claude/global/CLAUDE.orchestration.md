@@ -7,7 +7,7 @@ You (Opus) are the primary orchestrator. Follow the policy and identity rules im
 
 ## How delegation works (verified setup)
 
-Delegation runs through the OpenAI `codex` plugin's companion runtime, wrapped by `~/.claude/orchestration/scripts/codex-delegate.mjs`. The wrapper fixes model, sandbox and contract per role. Never pass a model by hand.
+Delegation runs through `codex exec`, wrapped by `~/.claude/orchestration/scripts/codex-delegate.mjs`; every run, foreground or background, is a detached job that `collect` can finalize even if the wrapper was killed. The wrapper fixes model, effort, sandbox and contract per role. Never pass a model by hand. `--backend companion` (the OpenAI `codex` plugin's runtime) remains available but is not the default.
 
 | Role | Model | Sandbox | Use for |
 |---|---|---|---|
@@ -22,7 +22,7 @@ Steps:
 2. Write a packet in `<project>/.orchestration/tasks/<id>.yaml`, starting from `~/.claude/orchestration/templates/` (`task-packet.yaml` for Luna/Sol, `review-packet.yaml` for Astra).
 3. Dispatch with the `luna-worker` or `astra-reviewer` subagent (pass packet path, role, and target repo dir), or run the wrapper yourself with the Bash tool:
    `node ~/.claude/orchestration/scripts/codex-delegate.mjs run --role <role> --packet <file> --cwd <repo> [--background]`
-4. Long tasks: use `--background`, then `node ~/.claude/orchestration/scripts/codex-delegate.mjs collect <run-id> --wait`. That prints the result, runs the git guard and finalizes telemetry. The run id is printed as `DELEGATE: run=…`. The plugin's `/codex:status` and `/codex:result` show the same jobs.
+4. Long tasks: use `--background`, then `node ~/.claude/orchestration/scripts/codex-delegate.mjs collect <run-id> --wait`. That prints the result, runs the git guard and finalizes telemetry. The run id is printed as `DELEGATE: run=…`. `status <run-id>`, `result <run-id>` and `cancel <run-id>` act on the job. On Windows, redirect a background submission's output to a file (`> file 2>&1`); otherwise the detached job holds the shell pipe open until it finishes. If a foreground run's wrapper is killed (for example by a tool timeout), finalize it with `collect <run-id> --wait`.
    Isolation: add `--worktree [--base <ref>]` when another worker or your own edits will touch the same repo while this run is in flight. The worker then runs in `<repo>-wt/<task>-<stamp>` on branch `orch/<task>-<stamp>`, starting from `<base>` (default HEAD), so it won't see uncommitted changes in the main checkout. After review, `worktree-apply <run-id>` copies its changes into the main checkout, unstaged. Make corrections there, then `assess`, then `worktree-clean <run-id>`.
 5. Review the result yourself: run the required checks, read the diff. A worker's report is evidence, not truth.
 6. Record your assessment with `assess` (see below).

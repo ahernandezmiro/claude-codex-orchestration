@@ -57,6 +57,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { resolveCodexBin, buildExecArgs, submitJob, readJob, waitJob, cancelJob, reconcileLost, normalizeExecResult } from "./exec-backend.mjs";
 import {
   QUOTA_BLOCKED_EXIT_CODE, loadQuotaRules, readQuotaSnapshot, ongoingReservations, evaluateQuotaGate, formatGateLine
 } from "./quota-gate.mjs";
@@ -206,7 +207,7 @@ function section(markdown, heading) {
 }
 
 // Locate codex-companion.mjs from the installed OpenAI codex-plugin-cc.
-function findCompanion() {
+function findCompanion({ quiet = false } = {}) {
   if (process.env.CODEX_COMPANION && fs.existsSync(process.env.CODEX_COMPANION)) {
     return process.env.CODEX_COMPANION;
   }
@@ -243,6 +244,7 @@ function findCompanion() {
     for (const version of subdirs(path.join(marketplace, "codex"))) pushIfPlugin(version);
   }
   if (candidates.length === 0) {
+    if (quiet) return null;
     fail("codex-companion.mjs not found. Is the OpenAI 'codex' plugin installed? Set CODEX_COMPANION to override.");
   }
   candidates.sort((a, b) => b.mtime - a.mtime);
@@ -542,7 +544,6 @@ async function cmdRun(options) {
   const { model, effort: configuredEffort } = loadModelSelection().selection[roleName];
   const effort = options.effort || configuredEffort;
   if (!VALID_EFFORTS.includes(effort)) fail(`--effort must be one of: ${VALID_EFFORTS.join(", ")}`);
-
   let blocks = splitTopLevel(fs.readFileSync(packetPath, "utf8"));
   const missing = role.required.filter((k) => !blocks.some((b) => b.key === k));
   if (missing.length) fail(`packet is missing required keys for ${roleName}: ${missing.join(", ")}`);
@@ -555,6 +556,10 @@ async function cmdRun(options) {
     blocks = blocks.filter((b) => role.allowed.includes(b.key));
   }
   const packetText = blocks.map((b) => b.text).join("\n");
+  const backend = options.backend || process.env.ORCH_BACKEND || "exec";
+  if (!["exec", "companion"].includes(backend)) fail(`--backend must be exec or companion (got ${backend})`);
+  const codexBin = backend === "exec" ? resolveCodexBin() : null;
+  if (codexBin && !codexBin.ok) fail(`codex CLI ${codexBin.reason}: ${codexBin.detail}`);
 
   ensureDirs();
   const taskIdRaw = packetScalar(blocks, "id") || "task";
@@ -604,7 +609,6 @@ async function cmdRun(options) {
   const args = ["task", "--cwd", cwd, "--model", model, "--effort", effort, "--prompt-file", promptFile, "--fresh"];
   if (role.write) args.push("--write");
   if (options.background) args.push("--background");
-
   const startedAt = nowIso();
   const run = {
     schema_version: 2,
@@ -637,6 +641,9 @@ async function cmdRun(options) {
     finished_at: null,
     duration_ms: null,
     companion_path: null,
+    backend,
+    exec: backend === "exec" ? { command: codexBin.command, source: codexBin.source, job_dir: `${base}.job`, thread_id: null,
+      failures: [], warnings: 0, reasons: [] } : null,
     companion_status: null,
     companion_signal: null,
     companion_error: null,
@@ -668,13 +675,41 @@ async function cmdRun(options) {
   console.log(`DELEGATE: prompt=${promptFile}`);
 
   if (options["dry-run"]) {
-    console.log(`DRY RUN: node <codex-companion> ${args.join(" ")}`);
-    console.log(`DRY RUN: companion=${findCompanion()}`);
-    run.companion_path = findCompanion();
+    if (backend === "exec") {
+      const execArgs = buildExecArgs({ cwd, model, effort, sandbox: run.sandbox, lastMessageFile: path.join(run.exec.job_dir, "last-message.txt") });
+      console.log(`DRY RUN: codex ${execArgs.join(" ")}`);
+    } else {
+      console.log(`DRY RUN: node <codex-companion> ${args.join(" ")}`);
+      console.log(`DRY RUN: companion=${findCompanion()}`);
+      run.companion_path = findCompanion();
+    }
     run.finished_at = nowIso();
     run.duration_ms = 0;
     saveRun(run, "run_finished");
     return 0;
+  }
+
+  if (backend === "exec") {
+    const jobDir = `${base}.job`;
+    const lastMessageFile = path.join(jobDir, "last-message.txt");
+    const execArgs = buildExecArgs({ cwd, model, effort, sandbox: run.sandbox, lastMessageFile });
+    const submitStarted = Date.now();
+    const submitted = await submitJob({ jobDir, command: codexBin.command, prefixArgs: codexBin.prefixArgs, args: execArgs, cwd, promptFile });
+    run.submission_ms = Date.now() - submitStarted;
+    run.job_id = `exec:${run.run_id}`;
+    if (submitted.state.status === "pending") console.log("EXEC: runner start not confirmed; collect will resolve it");
+    if (options.background) {
+      run.status = "submitted_background";
+      saveRun(run, "run_submitted_background");
+      console.log(`GIT GUARD: baseline saved. Finalize with collect ${run.run_id} --wait`);
+      console.log(`TELEMETRY: ${runFile}`);
+      return 0;
+    }
+    run.status = "running";
+    saveRun(run, "run_exec_submitted");
+    console.log(`EXEC: job ${jobDir}`);
+    const job = await waitJob(jobDir, { timeoutMs: Infinity });
+    return await finalizeExecRun(run, job);
   }
 
   if (options.background) {
@@ -718,6 +753,57 @@ async function cmdRun(options) {
 }
 
 /**
+ * Finalize an exec run from its detached runner record.
+ * Input: run record and readJob/waitJob result. Output: Promise<number> status-based exit code.
+ */
+async function finalizeExecRun(run, job) {
+  const jobDir = run.exec.job_dir;
+  if (job.state.status === "lost") {
+    await reconcileLost(jobDir);
+    job = readJob(jobDir);
+  }
+  if (job.state.status === "pending" && !job.state.runner_pid
+      && Date.now() - Date.parse(job.state.submitted_at || 0) > 60000) {
+    const stateFile = path.join(jobDir, "state.json");
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    state.status = "failed";
+    state.io_error = "runner never started";
+    state.finished_at = nowIso();
+    writeJson(stateFile, state);
+    job = readJob(jobDir);
+  }
+  if (!["completed", "failed", "cancelled"].includes(job.state.status)) return 0;
+  const events = job.events || { thread_id: null, failures: [], warnings: 0, reasons: [], usage: {} };
+  const normalized = normalizeExecResult({ state: job.state, events,
+    finalMessageExists: Boolean(job.finalMessage) });
+  const message = job.finalMessage ?? "";
+  fs.writeFileSync(run.stdout_file, message);
+  fs.writeFileSync(run.stderr_file, job.stderrTail || "");
+  mirror(message.endsWith("\n") || !message ? message : `${message}\n`);
+  const baseline = JSON.parse(fs.readFileSync(run.git_baseline_file, "utf8"));
+  const guard = verifyGit(baseline, { worktree: run.worktree });
+  run.git_guard = { ok: guard.ok, changed: guard.changed };
+  run.changed_files_after = gitChangedFiles(run.cwd);
+  recordWorkerResult(run, message);
+  run.status = !guard.ok ? "git_guard_violation" : normalized.status;
+  if (run.status !== "completed" && run.failure_hint !== "quota") run.failure_hint = normalized.failure_hint;
+  run.exec.thread_id = events.thread_id;
+  run.exec.failures = events.failures || [];
+  run.exec.warnings = events.warnings || 0;
+  run.exec.reasons = normalized.reasons || [];
+  run.codex_usage = events.usage || {};
+  run.finished_at = job.state.finished_at;
+  run.collected_at = nowIso();
+  const duration = job.state.started_at && job.state.finished_at
+    ? Date.parse(job.state.finished_at) - Date.parse(job.state.started_at) : null;
+  run.duration_ms = duration;
+  run.worker_duration_ms = duration;
+  saveRun(run, "run_collected");
+  console.log(`TELEMETRY: ${run.run_file}`);
+  return !guard.ok ? 3 : run.status === "completed" ? 0 : 1;
+}
+
+/**
  * Record what the worker produced, mechanically: content snapshot, touched files, patch size,
  * parsed completion report and a quota-stop hint. Mutates `run`.
  * Input: run (with git_root/baseline_tree when in a repo), worker output text.
@@ -740,59 +826,185 @@ function recordWorkerResult(run, output, reportedFiles = null) {
 }
 
 // Finalize a background run from the companion's machine-readable job record.
-function cmdCollect(options, positionals) {
+function collectExitCode(run) {
+  return run.status === "completed" ? 0 : run.status === "git_guard_violation" ? 3 : 1;
+}
+
+function alreadyFinalized(run) {
+  return Boolean(run.collected_at || (run.git_guard && !["running", "submitted_background"].includes(run.status)));
+}
+
+async function withFinalizeLock(run, fn) {
+  const lock = `${run.run_file}.lock`;
+  try {
+    fs.writeFileSync(lock, `${process.pid}\n`, { flag: "wx" });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    // A lock is live while its owner runs (collect --wait can hold it for a long time); a lock whose
+    // owner is gone, or an unreadable one older than 10 minutes, is stale.
+    const owner = Number(fs.readFileSync(lock, "utf8").trim());
+    let ownerAlive = false;
+    if (Number.isInteger(owner) && owner > 0) {
+      try { process.kill(owner, 0); ownerAlive = true; } catch (e) { ownerAlive = e.code === "EPERM"; }
+    } else {
+      ownerAlive = Date.now() - fs.statSync(lock).mtimeMs < 10 * 60 * 1000;
+    }
+    if (ownerAlive) {
+      console.log("COLLECT: another process is finalizing this run");
+      return 2;
+    }
+    fs.rmSync(lock, { force: true });
+    fs.writeFileSync(lock, `${process.pid}\n`, { flag: "wx" });
+  }
+  // fail() exits the process, which skips `finally`; release the lock on exit too.
+  const release = () => fs.rmSync(lock, { force: true });
+  process.once("exit", release);
+  try { return await fn(); }
+  finally { release(); process.removeListener("exit", release); }
+}
+
+function printAlreadyFinalized(run) {
+  console.log(`COLLECT: already finalized (${run.status})`);
+  try { mirror(fs.readFileSync(run.stdout_file, "utf8")); } catch {}
+  return collectExitCode(run);
+}
+
+async function cmdCollect(options, positionals) {
   if (!positionals[0]) fail("collect <run-id-or-json-path> [--wait] [--timeout-ms <ms>]");
   const run = loadRun(positionals[0]);
-  if (!run.background) fail(`run ${run.run_id} is not a background run; foreground runs are finalized automatically`);
-  if (!run.job_id) fail(`run ${run.run_id} has no recorded companion job id (submitted with an older wrapper?)`);
+  if (alreadyFinalized(run)) return printAlreadyFinalized(run);
+  const locked = withFinalizeLock(run, async () => {
+  const latest = loadRun(run.run_file);
+  if (alreadyFinalized(latest)) return printAlreadyFinalized(latest);
+  if (latest.backend === "exec") {
+    const jobDir = latest.exec.job_dir;
+    let job = readJob(jobDir);
+    if (job.state.status === "lost") {
+      await reconcileLost(jobDir);
+      job = readJob(jobDir);
+    }
+    if (! ["completed", "failed", "cancelled"].includes(job.state.status) && options.wait) {
+      const timeoutMs = options["timeout-ms"] == null ? Infinity : Number(options["timeout-ms"]);
+      job = await waitJob(jobDir, { timeoutMs });
+    }
+    const stalePending = job.state.status === "pending" && !job.state.runner_pid
+      && Date.now() - Date.parse(job.state.submitted_at || 0) > 60000;
+    if (stalePending) return finalizeExecRun(latest, job);
+    if (!["completed", "failed", "cancelled"].includes(job.state.status)) {
+      console.log(`COLLECT: job ${latest.job_id} is ${job.state.status}; not finalized. Re-run with --wait.`);
+      return 0;
+    }
+    return finalizeExecRun(latest, job);
+  }
+  if (!latest.background) fail(`run ${latest.run_id} is not a background run; foreground runs are finalized automatically`);
+  const companionRun = latest;
+  if (!companionRun.job_id) fail(`run ${companionRun.run_id} has no recorded companion job id (submitted with an older wrapper?)`);
   const companion = findCompanion();
   const capture = (args) => spawnSync(process.execPath, ["--no-deprecation", companion, ...args], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024
   });
   if (options.wait) {
-    capture(["status", run.job_id, "--cwd", run.cwd, "--wait", "--json",
+    capture(["status", companionRun.job_id, "--cwd", companionRun.cwd, "--wait", "--json",
       ...(options["timeout-ms"] ? ["--timeout-ms", options["timeout-ms"]] : [])]);
   }
-  const r = capture(["result", run.job_id, "--cwd", run.cwd, "--json"]);
+  const r = capture(["result", companionRun.job_id, "--cwd", companionRun.cwd, "--json"]);
   let payload;
-  try { payload = JSON.parse(r.stdout); } catch { fail(`could not parse companion result for ${run.job_id}:\n${r.stdout}${r.stderr}`); }
+  try { payload = JSON.parse(r.stdout); } catch { fail(`could not parse companion result for ${companionRun.job_id}:\n${r.stdout}${r.stderr}`); }
   const job = payload.storedJob || payload.job || {};
   if (!["completed", "failed", "cancelled"].includes(job.status)) {
-    console.log(`COLLECT: job ${run.job_id} is ${job.status || "unknown"} (phase ${job.phase || "?"}); not finalized. Re-run with --wait.`);
+    console.log(`COLLECT: job ${companionRun.job_id} is ${job.status || "unknown"} (phase ${job.phase || "?"}); not finalized. Re-run with --wait.`);
     return 0;
   }
   const output = job.result?.rawOutput ?? job.rendered ?? "";
-  fs.writeFileSync(run.stdout_file, output);
+  fs.writeFileSync(companionRun.stdout_file, output);
   mirror(output.endsWith("\n") ? output : `${output}\n`);
 
-  const baseline = JSON.parse(fs.readFileSync(run.git_baseline_file, "utf8"));
-  const guard = verifyGit(baseline, { worktree: run.worktree });
-  run.git_guard = { ok: guard.ok, changed: guard.changed };
-  run.changed_files_after = gitChangedFiles(run.cwd);
-  run.companion_status = job.result?.status ?? null;
-  run.job_started_at = job.startedAt ?? null;
-  run.finished_at = job.completedAt ?? nowIso();
-  run.collected_at = nowIso();
+  const baseline = JSON.parse(fs.readFileSync(companionRun.git_baseline_file, "utf8"));
+  const guard = verifyGit(baseline, { worktree: companionRun.worktree });
+  companionRun.git_guard = { ok: guard.ok, changed: guard.changed };
+  companionRun.changed_files_after = gitChangedFiles(companionRun.cwd);
+  companionRun.companion_status = job.result?.status ?? null;
+  companionRun.job_started_at = job.startedAt ?? null;
+  companionRun.finished_at = job.completedAt ?? nowIso();
+  companionRun.collected_at = nowIso();
   if (job.startedAt && job.completedAt) {
-    run.duration_ms = Date.parse(job.completedAt) - Date.parse(job.startedAt);
-    run.worker_duration_ms = run.duration_ms;
+    companionRun.duration_ms = Date.parse(job.completedAt) - Date.parse(job.startedAt);
+    companionRun.worker_duration_ms = companionRun.duration_ms;
   } else {
-    run.duration_ms = null;
+    companionRun.duration_ms = null;
   }
-  run.status = !guard.ok ? "git_guard_violation"
+  companionRun.status = !guard.ok ? "git_guard_violation"
     : job.status === "cancelled" ? "cancelled"
     : (job.status === "completed" && (job.result?.status ?? 0) === 0) ? "completed" : "failed";
   // Records submitted by a schema-1 wrapper have no baseline tree: companion file list only.
-  if (!run.baseline_tree && baseline?.tree) run.baseline_tree = baseline.tree;
-  if (!run.git_root && baseline?.root) run.git_root = baseline.root;
-  recordWorkerResult(run, output, job.result?.touchedFiles ?? []);
-  saveRun(run, "run_collected");
-  console.log(`TELEMETRY: ${run.run_file}`);
+  if (!companionRun.baseline_tree && baseline?.tree) companionRun.baseline_tree = baseline.tree;
+  if (!companionRun.git_root && baseline?.root) companionRun.git_root = baseline.root;
+  recordWorkerResult(companionRun, output, job.result?.touchedFiles ?? []);
+  saveRun(companionRun, "run_collected");
+  console.log(`TELEMETRY: ${companionRun.run_file}`);
   return guard.ok ? 0 : 3;
+  });
+  return await locked;
 }
 
-function cmdPassThrough(command, options, positionals) {
+async function cmdPassThrough(command, options, positionals) {
+  const reference = positionals[0];
+  const runRef = reference?.startsWith("exec:") ? reference.slice(5) : reference;
+  if (reference && (reference.startsWith("exec:") || fs.existsSync(RUNS_DIR))) {
+    const direct = path.resolve(runRef);
+    const possibleFiles = [
+      direct,
+      `${direct}.run.json`,
+      path.join(RUNS_DIR, runRef.endsWith(".run.json") ? runRef : `${runRef}.run.json`)
+    ];
+    let execRun = null;
+    for (const file of possibleFiles) {
+      try {
+        if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+          const candidate = JSON.parse(fs.readFileSync(file, "utf8"));
+          if (candidate.backend === "exec") { execRun = { ...candidate, run_file: file }; break; }
+        }
+      } catch { /* unrelated or incomplete run record */ }
+    }
+    if (!execRun && fs.existsSync(RUNS_DIR)) {
+      for (const name of fs.readdirSync(RUNS_DIR).filter((item) => item.endsWith(".run.json") && item.includes(runRef))) {
+        const file = path.join(RUNS_DIR, name);
+        try {
+          const candidate = JSON.parse(fs.readFileSync(file, "utf8"));
+          if (candidate.backend === "exec") { execRun = { ...candidate, run_file: file }; break; }
+        } catch { /* ignore malformed records */ }
+      }
+    }
+    if (execRun) {
+      const jobDir = execRun.exec.job_dir;
+      if (command === "status") {
+        const job = options.wait ? await waitJob(jobDir, { timeoutMs: options["timeout-ms"] == null ? Infinity : Number(options["timeout-ms"]) }) : readJob(jobDir);
+        console.log(`EXEC: ${execRun.job_id} ${job.state.status}`);
+        return 0;
+      }
+      if (command === "result") {
+        const job = readJob(jobDir);
+        console.log(job.finalMessage ?? "not finished");
+        return 0;
+      }
+      if (command === "cancel") {
+        const result = await cancelJob(jobDir);
+        if (result.ok) {
+          const job = readJob(jobDir);
+          await finalizeExecRun(execRun, job);
+          console.log("CANCELLED");
+          return 0;
+        }
+        if (["completed", "failed", "cancelled"].includes(result.status)) {
+          console.log(`CANCEL: run already ${result.status}`);
+          return 2;
+        }
+        console.error(`CANCEL: ${result.detail || `could not stop run (${result.status})`}`);
+        return 1;
+      }
+    }
+  }
   const args = [
     command,
     ...positionals,
@@ -845,6 +1057,7 @@ function cmdShow(options, positionals) {
   }
   const summary = {
     run_id: run.run_id,
+    backend: run.backend ?? "companion",
     task_id: run.task_id,
     parent: run.parent,
     role: run.role,
@@ -865,6 +1078,8 @@ function cmdShow(options, positionals) {
     worker_report: run.worker_report,
     required_checks_count: run.required_checks_count,
     failure_hint: run.failure_hint,
+    codex_usage: run.codex_usage,
+    exec: run.exec,
     assessment: run.assessment,
     post_worker: run.post_worker,
     worktree: run.worktree,
@@ -1129,6 +1344,11 @@ function cmdMetrics(options) {
   const metrics = {
     window: { since: options.since || null },
     runs_total: runs.length,
+    codex_usage: runs.reduce((totals, run) => {
+      for (const key of ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"])
+        totals[key] += Number(run.codex_usage?.[key]) || 0;
+      return totals;
+    }, { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 }),
     completed_total: completed.length,
     assessed_total: assessed.length,
     assessment_coverage_pct: pct(assessed.length, runs.length),
@@ -1190,7 +1410,7 @@ switch (command) {
   case "status":
   case "result":
   case "cancel":
-    process.exit(cmdPassThrough(command, options, positionals));
+    process.exit(await cmdPassThrough(command, options, positionals));
   case "verify-git": {
     if (!positionals[0]) fail("verify-git <baseline.json>");
     const baseline = JSON.parse(fs.readFileSync(positionals[0], "utf8"));
@@ -1198,8 +1418,13 @@ switch (command) {
     process.exit(guard.ok ? 0 : 3);
   }
   case "which":
-    console.log(findCompanion());
-    process.exit(0);
+    {
+      const bin = resolveCodexBin();
+      const companion = findCompanion({ quiet: true });
+      console.log(bin.ok ? `codex: ${bin.command} (${bin.source})` : `codex: not found (${bin.reason}: ${bin.detail})`);
+      console.log(companion ? `companion: ${companion}` : "companion: not found");
+      process.exit(bin.ok || companion ? 0 : 2);
+    }
   case "models": {
     const { selection, sources } = loadModelSelection();
     if (options.json) console.log(JSON.stringify({ sources, roles: selection }, null, 2));
@@ -1220,7 +1445,7 @@ switch (command) {
   case "metrics":
     process.exit(cmdMetrics(options));
   case "collect":
-    process.exit(cmdCollect(options, positionals));
+    process.exit(await cmdCollect(options, positionals));
   case "abandon":
     process.exit(cmdAbandon(options, positionals));
   case "worktree-apply":

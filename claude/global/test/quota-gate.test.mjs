@@ -117,7 +117,9 @@ function stage() {
   fs.rmSync(path.join(dir, "config", "models.local.json"), { force: true });
   const companion = path.join(dir, "stub-codex-companion.mjs");
   fs.writeFileSync(companion, "process.exit(99);\n");
-  return { stage: dir, companion, wrapper: path.join(dir, "scripts", "codex-delegate.mjs") };
+  const sentinel = path.join(dir, "sentinel-codex.mjs");
+  fs.writeFileSync(sentinel, `import fs from "node:fs"; fs.appendFileSync(${JSON.stringify(path.join(dir, "sentinel-marker.txt"))}, "called\\n"); process.exit(97);\n`);
+  return { stage: dir, companion, sentinel, wrapper: path.join(dir, "scripts", "codex-delegate.mjs") };
 }
 
 /**
@@ -129,7 +131,7 @@ function runWithQuota(s, role, usedPercent) {
   fs.writeFileSync(snap, JSON.stringify({ usedPercent, windowMinutes: 300, resetsAt: Math.floor(Date.now() / 1000) + 3600 }));
   const packet = role.startsWith("astra") ? "R001-slug-registry.yaml" : "T001-slugify.yaml";
   return spawnSync(process.execPath, [s.wrapper, "run", "--role", role, "--packet", path.join(HERE, packet), "--cwd", s.stage], {
-    encoding: "utf8", env: { ...process.env, CODEX_COMPANION: s.companion, CODEX_QUOTA_SNAPSHOT: snap }
+    encoding: "utf8", env: { ...process.env, ORCH_BACKEND: "companion", CODEX_BIN: s.sentinel, CODEX_COMPANION: s.companion, CODEX_QUOTA_SNAPSHOT: snap }
   });
 }
 
@@ -172,7 +174,7 @@ test("CLI: dry runs skip the gate entirely", () => {
     const r = runWithQuota(s, "astra-review", 100);
     assert.equal(r.status, 5);
     const dry = spawnSync(process.execPath, [s.wrapper, "run", "--role", "astra-review", "--packet", path.join(HERE, "R001-slug-registry.yaml"), "--cwd", s.stage, "--dry-run"], {
-      encoding: "utf8", env: { ...process.env, CODEX_COMPANION: s.companion, CODEX_QUOTA_SNAPSHOT: path.join(s.stage, "snapshot.json") }
+      encoding: "utf8", env: { ...process.env, ORCH_BACKEND: "companion", CODEX_BIN: s.sentinel, CODEX_COMPANION: s.companion, CODEX_QUOTA_SNAPSHOT: path.join(s.stage, "snapshot.json") }
     });
     assert.equal(dry.status, 0, dry.stdout + dry.stderr);
     assert.doesNotMatch(dry.stdout, /QUOTA GATE/);

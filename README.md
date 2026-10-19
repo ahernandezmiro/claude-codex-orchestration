@@ -19,6 +19,7 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 | `claude/global/scripts/pack-telemetry.mjs` | zips runs + telemetry for offline analysis | `~/.claude/orchestration/scripts/` |
 | `claude/global/scripts/telemetry-lib.mjs` | schema-2 attribution: working-tree snapshots, worker/post-worker diff stats, report parsing, `metrics --by` | same |
 | `claude/global/scripts/opus-usage.mjs` | offline: Claude tokens spent between each worker result and its assessment, from local session transcripts | same |
+| `claude/global/scripts/exec-backend.mjs`, `exec-runner.mjs` | default backend: shell-free `codex exec` resolution and argv, detached job runner with atomic state, event normalization, verified cancel | same |
 | `claude/global/config/models.local.json` | optional per-machine override (gitignored) | same, if present |
 | `claude/global/agents/*.md` | `luna-worker`, `astra-reviewer` subagents | `~/.claude/agents/` |
 | `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | managed block in `~/.claude/CLAUDE.md` |
@@ -29,7 +30,7 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 
 ## Deploy (fresh install or update)
 
-Prerequisites on each machine: Node.js 18+, Codex CLI logged in (`codex login`), and OpenAI's `codex` plugin installed in Claude Code.
+Prerequisites on each machine: Node.js 18+ and the Codex CLI logged in (`codex login`). On Windows the wrapper needs the real `codex.exe` on PATH (the standalone installer provides it); with only npm's `codex.cmd` shim, set `CODEX_BIN` to the executable or the package's JS entry. OpenAI's `codex` Claude plugin is optional: it's only used with `--backend companion`.
 
 Windows (PowerShell):
 ```powershell

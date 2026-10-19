@@ -247,3 +247,15 @@ Gotchas seen on the first machine:
 - Foreground runs now capture output and print it when Codex finishes, not live. The Bash tool only shows output at the end anyway.
 - Runs submitted in the background before the telemetry extension have no job ID and can't be collected; use `result` + `verify-git` for those.
 - Telemetry can't measure tokens or quota (the companion doesn't expose them).
+
+## 8. Backend change (2026-10): `codex exec` by default
+
+Sections 1–7 describe the original companion-based setup. Since roadmap step 3 the wrapper defaults to `codex exec`:
+
+- **Why:** the companion script's install path is undocumented and moved between desktop versions (runs failed with "companion not found", one result was lost with "No job found"). The companion also needs the Codex CLI itself (it spawns `codex app-server`), so it never was a CLI-free path.
+- **Invocation:** `codex exec --json --skip-git-repo-check -s <role sandbox> -m <model> -c model_reasoning_effort=<effort> -c approval_policy=never -C <cwd> -o <job>/last-message.txt -`, with the unchanged prompt file on stdin. No shell is used anywhere; npm's `codex.cmd` shim is refused with a hint to set `CODEX_BIN`.
+- **Jobs:** each run gets `<run>.job/` with `spec.json`, `state.json` (atomic writes; `pending → running → completed|failed|cancelled`), `events.jsonl`, `stderr.txt`, `last-message.txt` and `cancel.request` when cancelling. A detached `exec-runner.mjs` supervises the Codex process. Foreground runs submit and wait, so a killed wrapper leaves a job that `collect` finalizes.
+- **Result:** one normalization decides the status. Completed means exit 0, at least one `turn.completed` and no `turn.failed`/`error` event. Usage-limit messages give `failure_hint: quota`.
+- **Telemetry gains:** `codex_usage` (input, cached, output, reasoning tokens) per run, and `exec.{thread_id, failures, warnings, reasons}`. `collect` is idempotent: it never re-snapshots a finalized run, and it locks finalization per run (the lock follows its owner's PID).
+- **Commands:** `status|result|cancel <run-id | exec:<run-id>>` act on exec jobs; anything else passes through to the companion. `which` reports both. `--backend companion` (or `ORCH_BACKEND=companion`) selects the old path; there's no automatic fallback.
+- **Known:** on Windows the detached runner inherits the caller's stdout pipe, so `run --background | …` blocks until the job ends. Redirect to a file instead. The companion had the same behaviour.

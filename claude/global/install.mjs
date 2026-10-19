@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { resolveCodexBin } from "./scripts/exec-backend.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const KIT = path.resolve(HERE, "..", "..");
@@ -83,10 +84,11 @@ function preflight() {
   };
   const major = Number(process.versions.node.split(".")[0]);
   check("node >= 18", major >= 18, process.version);
-  const codex = run("codex", ["--version"]);
-  check("codex CLI on PATH", codex.ok, codex.out.split("\n").pop());
-  const login = run("codex", ["login", "status"]);
-  check("codex logged in", login.ok && /logged in/i.test(login.out), login.out.split("\n").pop());
+  const codexBin = resolveCodexBin();
+  check("codex CLI", codexBin.ok, codexBin.ok ? `${codexBin.command} (${codexBin.source})` : `${codexBin.reason}: ${codexBin.detail}`);
+  const login = codexBin.ok ? spawnSync(codexBin.command, [...codexBin.prefixArgs, "login", "status"], { encoding: "utf8", shell: false }) : null;
+  const loginOut = login ? `${login.stdout ?? ""}${login.stderr ?? ""}` : "Codex CLI unavailable";
+  check("codex logged in", Boolean(login && login.status === 0 && /logged in/i.test(loginOut)), loginOut.trim().split("\n").pop());
   const cache = path.join(os.homedir(), ".codex", "models_cache.json");
   let slugs = [];
   try {
@@ -98,7 +100,8 @@ function preflight() {
   }
   const wrapper = path.join(HERE, "scripts", "codex-delegate.mjs");
   const which = spawnSync(process.execPath, [wrapper, "which"], { encoding: "utf8" });
-  check("OpenAI 'codex' Claude plugin (codex-companion.mjs)", which.status === 0, (which.stdout || which.stderr).trim());
+  const companionFound = which.status === 0 && !/companion: not found/.test(which.stdout || "");
+  console.log(`  [info] companion ${companionFound ? "installed" : "not installed (only needed for --backend companion)"}`);
   const mcp = run("codex", ["mcp-server", "--help"]);
   console.log(`  [info] codex mcp-server ${/Usage: codex(.exe)? mcp-server/i.test(mcp.out) ? "available (codex-dispatch plugin usable)" : "not available (codex-dispatch plugin unusable)"}`);
   return ok;

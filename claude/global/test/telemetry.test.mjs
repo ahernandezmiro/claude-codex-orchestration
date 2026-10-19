@@ -173,15 +173,22 @@ function stage() {
   fs.rmSync(path.join(dir, "config", "models.local.json"), { force: true });
   const companion = path.join(dir, "stub-codex-companion.mjs");
   fs.writeFileSync(companion, STUB);
+  const sentinel = path.join(dir, "sentinel-codex.mjs");
+  const sentinelMarker = path.join(dir, "sentinel-marker.txt");
+  fs.writeFileSync(sentinel, `import fs from "node:fs"; fs.appendFileSync(${JSON.stringify(sentinelMarker)}, "called\\n"); process.exit(97);\n`);
   const snap = path.join(dir, "snapshot.json");
   fs.writeFileSync(snap, JSON.stringify({ usedPercent: 0, windowMinutes: 300, resetsAt: Math.floor(Date.now() / 1000) + 3600 }));
   const wrapper = path.join(dir, "scripts", "codex-delegate.mjs");
-  const cli = (...args) => spawnSync(process.execPath, [wrapper, ...args], {
-    encoding: "utf8", env: { ...process.env, CODEX_COMPANION: companion, CODEX_QUOTA_SNAPSHOT: snap }
-  });
+  const cli = (...args) => {
+    const result = spawnSync(process.execPath, [wrapper, ...args], {
+      encoding: "utf8", env: { ...process.env, ORCH_BACKEND: "companion", CODEX_BIN: sentinel, CODEX_COMPANION: companion, CODEX_QUOTA_SNAPSHOT: snap }
+    });
+    assert.equal(fs.existsSync(sentinelMarker), false, "the Codex sentinel must not be invoked by companion tests");
+    return result;
+  };
   const runs = () => fs.readdirSync(path.join(dir, "runs")).filter((f) => f.endsWith(".run.json"))
     .map((f) => JSON.parse(fs.readFileSync(path.join(dir, "runs", f), "utf8")));
-  return { dir, cli, runs };
+  return { dir, cli, runs, sentinelMarker };
 }
 
 const packet = path.join(HERE, "T001-slugify.yaml");
@@ -193,6 +200,7 @@ test("foreground run records touched files, patch, report; assess measures post-
     const r = s.cli("run", "--role", "luna-implement", "--packet", packet, "--cwd", repo);
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const [run] = s.runs();
+    assert.equal(fs.existsSync(s.sentinelMarker), false, "legacy wrapper must not probe the real Codex executable");
     assert.equal(run.schema_version, 2);
     assert.equal(run.status, "completed");
     assert.equal(run.touched_files_source, "git");

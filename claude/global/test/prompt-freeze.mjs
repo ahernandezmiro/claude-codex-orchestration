@@ -96,18 +96,20 @@ function stageInstalledLayout() {
   // Dry runs only need the companion path to exist; it is never executed.
   const companion = path.join(stage, "stub-codex-companion.mjs");
   fs.writeFileSync(companion, "process.exit(99);\n");
-  return { stage, companion };
+  const sentinel = path.join(stage, "sentinel-codex.mjs");
+  fs.writeFileSync(sentinel, `import fs from "node:fs"; fs.appendFileSync(${JSON.stringify(path.join(stage, "sentinel-marker.txt"))}, "called\\n"); process.exit(97);\n`);
+  return { stage, companion, sentinel };
 }
 
 /**
  * Generate the worker prompt for one role through the real wrapper in dry-run mode.
  * Input: staged layout, role case. Output: prompt text, or throws with wrapper output.
  */
-function generateWorkerPrompt({ stage, companion }, { role, packet }) {
+function generateWorkerPrompt({ stage, companion, sentinel }, { role, packet }) {
   const r = spawnSync(process.execPath, [
     path.join(stage, "scripts", "codex-delegate.mjs"), "run",
     "--role", role, "--packet", path.join(HERE, packet), "--cwd", stage, "--dry-run"
-  ], { encoding: "utf8", env: { ...process.env, CODEX_COMPANION: companion } });
+  ], { encoding: "utf8", env: { ...process.env, ORCH_BACKEND: "companion", CODEX_BIN: sentinel, CODEX_COMPANION: companion } });
   if (r.status !== 0) throw new Error(`dry run failed for ${role} (exit ${r.status}):\n${r.stdout}${r.stderr}`);
   const promptLine = r.stdout.split(/\r?\n/).find((l) => l.startsWith("DELEGATE: prompt="));
   if (!promptLine) throw new Error(`no prompt path reported for ${role}:\n${r.stdout}`);
