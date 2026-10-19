@@ -23,9 +23,17 @@
 //   node codex-delegate.mjs show <run-id-or-json-path> [--json]
 //   node codex-delegate.mjs assess <run-id-or-json-path> --outcome <accepted|minor_rework|major_rework|failed|not_applicable>
 //        [--useful <yes|no|mixed>] [--findings <n>] [--accepted-findings <n>] [--rework-rounds <n>] [--notes <text>]
+//        [--cause <c1,c2>] [--verified <tests,runtime,visual|none>] [--verified-findings <n>] [--critical-findings <n>]
 //   node codex-delegate.mjs record-skip --task-id <id> --task-type <type> --reason <text> [--cwd <repo>]
-//   node codex-delegate.mjs metrics [--json] [--role <role>] [--since <ISO-date-or-days>]
+//   node codex-delegate.mjs metrics [--json] [--role <role>] [--since <ISO-date-or-days>] [--by <dimension>] [--runs-dir <dir> [--all]]
 //   node codex-delegate.mjs collect <run-id-or-json-path> [--wait] [--timeout-ms <ms>]   // finalize a background run
+//   node codex-delegate.mjs abandon <run-id-or-json-path> [--reason <text>]   // close a run that will never finalize
+//
+// Attribution (schema 2, see telemetry-lib.mjs): every real run snapshots the working tree before
+// the worker starts (baseline_tree) and when its result is finalized (worker_tree). The worker's
+// files and patch size come from the diff between the two, so dirty trees and foreground runs are
+// covered. `assess` diffs worker_tree against the current tree, limited to those files, to measure
+// what Opus changed afterwards (post_worker).
 //
 // New run options:
 //   --reason <why this delegation was selected>
@@ -51,6 +59,10 @@ import { fileURLToPath } from "node:url";
 import {
   QUOTA_BLOCKED_EXIT_CODE, loadQuotaRules, readQuotaSnapshot, ongoingReservations, evaluateQuotaGate, formatGateLine
 } from "./quota-gate.mjs";
+import {
+  VALID_CAUSES, VALID_VERIFIED, UNFINALIZED_STATUSES, GROUP_KEYS, snapshotTree, changedPaths, diffStat,
+  parseWorkerReport, countListItems, looksLikeQuotaStop, overlappingRuns, churn, groupMetrics, formatGroupTable
+} from "./telemetry-lib.mjs";
 
 const KIT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS_DIR = path.join(KIT_ROOT, "runs");
@@ -439,7 +451,7 @@ function enforceBudget({ options, taskId, roleName }) {
   if (max == null) return;
   if (!Number.isInteger(max) || max < 1) fail("--max-attempts must be an integer >= 1");
   const budgetKey = options["budget-key"] || `${taskId}:${roleName}`;
-  const prior = readAllRuns().filter((r) => r.budget_key === budgetKey && !["dry_run", "cancelled"].includes(r.status));
+  const prior = readAllRuns().filter((r) => r.budget_key === budgetKey && !["dry_run", "cancelled", "abandoned"].includes(r.status));
   if (prior.length >= max) {
     fail(`orchestration budget exceeded for '${budgetKey}': ${prior.length}/${max} attempts already recorded`, 4);
   }
@@ -541,6 +553,8 @@ async function cmdRun(options) {
   fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText));
 
   const baseline = gitSnapshot(cwd);
+  // Content snapshot for attribution; dry runs never reach a worker, so they skip the hashing cost.
+  if (baseline && !options["dry-run"]) baseline.tree = snapshotTree(baseline.root);
   writeJson(baselineFile, baseline);
 
   const args = ["task", "--cwd", cwd, "--model", model, "--effort", effort, "--prompt-file", promptFile, "--fresh"];
@@ -549,7 +563,7 @@ async function cmdRun(options) {
 
   const startedAt = nowIso();
   const run = {
-    schema_version: 1,
+    schema_version: 2,
     run_id: runIdFromBase(base),
     run_file: runFile,
     task_id: taskIdRaw,
@@ -587,6 +601,18 @@ async function cmdRun(options) {
     git_guard: null,
     dirty_before: porcelainFiles(baseline?.porcelain),
     changed_files_after: [],
+    git_root: baseline?.root ?? null,
+    baseline_tree: baseline?.tree ?? null,
+    worker_tree: null,
+    touched_files: [],
+    touched_files_source: null,
+    worker_patch: null,
+    required_checks_count: countListItems(blocks.find((b) => b.key === "required_checks")?.text),
+    worker_report: null,
+    failure_hint: null,
+    submission_ms: null,
+    worker_duration_ms: null,
+    collected_at: null,
     assessment: null
   };
   saveRun(run, "run_started");
@@ -613,9 +639,10 @@ async function cmdRun(options) {
     run.companion_status = result.status;
     run.companion_signal = result.signal;
     run.companion_error = result.error;
-    run.duration_ms = result.durationMs;
-    run.finished_at = nowIso();
+    // Submission time only; worker runtime (duration_ms, worker_duration_ms) is set by `collect`.
+    run.submission_ms = result.durationMs;
     run.status = result.status === 0 ? "submitted_background" : "submission_failed";
+    if (run.status === "submission_failed") run.finished_at = nowIso();
     saveRun(run, "run_submitted_background");
     console.log(`GIT GUARD: baseline saved. When the job finishes, finalize the run (result + git guard + telemetry):\n  node ~/.claude/orchestration/scripts/codex-delegate.mjs collect ${run.run_id} --wait`);
     console.log(`TELEMETRY: ${runFile}`);
@@ -632,15 +659,39 @@ async function cmdRun(options) {
   run.companion_signal = result.signal;
   run.companion_error = result.error;
   run.duration_ms = result.durationMs;
+  run.worker_duration_ms = result.durationMs;
   run.finished_at = nowIso();
   run.git_guard = { ok: guard.ok, changed: guard.changed };
   run.changed_files_after = gitChangedFiles(cwd);
   run.status = !guard.ok ? "git_guard_violation" : (result.status === 0 ? "completed" : "failed");
+  recordWorkerResult(run, `${result.stdout}\n${result.stderr}`);
   saveRun(run, "run_finished");
 
   console.log(`TELEMETRY: ${runFile}`);
   if (!guard.ok) return 3;
   return result.status;
+}
+
+/**
+ * Record what the worker produced, mechanically: content snapshot, touched files, patch size,
+ * parsed completion report and a quota-stop hint. Mutates `run`.
+ * Input: run (with git_root/baseline_tree when in a repo), worker output text.
+ * Falls back to companion-reported files (`reportedFiles`) when no snapshot is possible.
+ */
+function recordWorkerResult(run, output, reportedFiles = null) {
+  if (run.git_root && run.baseline_tree) {
+    run.worker_tree = snapshotTree(run.git_root);
+    const rel = changedPaths(run.git_root, run.baseline_tree, run.worker_tree);
+    run.touched_files = rel.map((f) => path.join(run.git_root, f));
+    run.touched_files_source = "git";
+    run.worker_patch = diffStat(run.git_root, run.baseline_tree, run.worker_tree);
+  } else if (reportedFiles) {
+    run.touched_files = reportedFiles;
+    run.touched_files_source = "companion";
+  }
+  if (reportedFiles) run.touched_files_reported = reportedFiles;
+  run.worker_report = parseWorkerReport(output);
+  if (run.status === "failed" && looksLikeQuotaStop(output)) run.failure_hint = "quota";
 }
 
 // Finalize a background run from the companion's machine-readable job record.
@@ -674,14 +725,23 @@ function cmdCollect(options, positionals) {
   const guard = verifyGit(baseline);
   run.git_guard = { ok: guard.ok, changed: guard.changed };
   run.changed_files_after = gitChangedFiles(run.cwd);
-  run.touched_files = job.result?.touchedFiles ?? [];
   run.companion_status = job.result?.status ?? null;
   run.job_started_at = job.startedAt ?? null;
   run.finished_at = job.completedAt ?? nowIso();
-  if (job.startedAt && job.completedAt) run.duration_ms = Date.parse(job.completedAt) - Date.parse(job.startedAt);
+  run.collected_at = nowIso();
+  if (job.startedAt && job.completedAt) {
+    run.duration_ms = Date.parse(job.completedAt) - Date.parse(job.startedAt);
+    run.worker_duration_ms = run.duration_ms;
+  } else {
+    run.duration_ms = null;
+  }
   run.status = !guard.ok ? "git_guard_violation"
     : job.status === "cancelled" ? "cancelled"
     : (job.status === "completed" && (job.result?.status ?? 0) === 0) ? "completed" : "failed";
+  // Records submitted by a schema-1 wrapper have no baseline tree: companion file list only.
+  if (!run.baseline_tree && baseline?.tree) run.baseline_tree = baseline.tree;
+  if (!run.git_root && baseline?.root) run.git_root = baseline.root;
+  recordWorkerResult(run, output, job.result?.touchedFiles ?? []);
   saveRun(run, "run_collected");
   console.log(`TELEMETRY: ${run.run_file}`);
   return guard.ok ? 0 : 3;
@@ -703,6 +763,7 @@ function cmdPassThrough(command, options, positionals) {
 
 function cmdRuns(options) {
   let runs = readAllRuns();
+  const unfinalized = runs.filter((r) => UNFINALIZED_STATUSES.includes(r.status));
   if (options.role) runs = runs.filter((r) => r.role === options.role);
   if (options.status) runs = runs.filter((r) => r.status === options.status);
   const limit = options.limit ? Number(options.limit) : 25;
@@ -722,6 +783,10 @@ function cmdRuns(options) {
       r.started_at || "-", r.role || "-", r.model || "-", r.status || "-",
       r.assessment?.outcome || "-", r.assessment?.useful || "-", r.task_id || "-", r.run_id || "-"
     ].join("\t"));
+  }
+  if (unfinalized.length) {
+    console.log(`\n${unfinalized.length} run(s) not finalized (running/submitted_background). Use collect, or abandon for orphans:`);
+    for (const r of unfinalized) console.log(`  ${r.status}\t${r.run_id}`);
   }
   return 0;
 }
@@ -745,9 +810,18 @@ function cmdShow(options, positionals) {
     started_at: run.started_at,
     finished_at: run.finished_at,
     duration_ms: run.duration_ms,
+    worker_duration_ms: run.worker_duration_ms,
+    collected_at: run.collected_at,
     git_guard: run.git_guard,
     changed_files_after: run.changed_files_after,
+    touched_files: run.touched_files,
+    touched_files_source: run.touched_files_source,
+    worker_patch: run.worker_patch,
+    worker_report: run.worker_report,
+    required_checks_count: run.required_checks_count,
+    failure_hint: run.failure_hint,
     assessment: run.assessment,
+    post_worker: run.post_worker,
     prompt_file: run.prompt_file,
     stdout_file: run.stdout_file,
     stderr_file: run.stderr_file
@@ -765,23 +839,97 @@ function cmdAssess(options, positionals) {
     fail(`--useful must be one of: ${VALID_USEFULNESS.join(", ")}`);
   }
   const numeric = (key) => options[key] == null ? null : Number(options[key]);
-  for (const key of ["findings", "accepted-findings", "rework-rounds"]) {
+  for (const key of ["findings", "accepted-findings", "rework-rounds", "verified-findings", "critical-findings"]) {
     const v = numeric(key);
     if (v != null && (!Number.isInteger(v) || v < 0)) fail(`--${key} must be an integer >= 0`);
   }
+  for (const key of ["accepted-findings", "verified-findings", "critical-findings"]) {
+    if (numeric(key) != null && numeric("findings") != null && numeric(key) > numeric("findings")) {
+      fail(`--${key} cannot exceed --findings`);
+    }
+  }
+  const list = (key, valid) => {
+    if (options[key] == null) return [];
+    const values = String(options[key]).split(",").map((s) => s.trim()).filter(Boolean);
+    const bad = values.filter((v) => !valid.includes(v));
+    if (bad.length) fail(`--${key} values must be from: ${valid.join(", ")} (got ${bad.join(", ")})`);
+    return [...new Set(values)];
+  };
+  const cause = list("cause", VALID_CAUSES);
+  const verified = list("verified", VALID_VERIFIED);
+  if (verified.includes("none") && verified.length > 1) fail("--verified none cannot be combined with other values");
+
   const run = loadRun(positionals[0]);
+  const assessedAt = nowIso();
+  if (UNFINALIZED_STATUSES.includes(run.status)) {
+    console.log(`ASSESS WARNING: run is still '${run.status}'. Finalize it first (collect for background runs, abandon for orphans); worker timing and files are not recorded yet.`);
+  }
   run.assessment = {
-    assessed_at: nowIso(),
+    assessed_at: assessedAt,
     outcome: options.outcome,
     useful: options.useful || null,
     findings: numeric("findings"),
     accepted_findings: numeric("accepted-findings"),
+    verified_findings: numeric("verified-findings"),
+    critical_findings: numeric("critical-findings"),
     rework_rounds: numeric("rework-rounds"),
+    cause,
+    verified,
+    status_at_assessment: run.status,
     notes: options.notes || null
   };
+  run.post_worker = measurePostWorker(run, assessedAt);
   saveRun(run, "run_assessed");
   console.log(`ASSESSED: ${run.run_id}`);
   console.log(JSON.stringify(run.assessment, null, 2));
+  if (run.post_worker?.measured) {
+    const p = run.post_worker;
+    console.log(`REWRITE: worker ${churn(run.worker_patch)} lines in ${run.worker_patch?.files ?? 0} files; `
+      + `changed afterwards ${churn(p)} lines in ${p.files} files (ratio ${p.rewrite_ratio ?? "-"}, attribution ${p.attribution})`);
+  } else if (run.post_worker) {
+    console.log(`REWRITE: not measured (${run.post_worker.reason})`);
+  }
+  return 0;
+}
+
+/**
+ * Measure what changed in the worker's files after its result was recorded: diff worker_tree
+ * against the current working tree, limited to touched files. Re-assessing re-measures.
+ * Input: run, assessment time. Output: post_worker record ({ measured: false, reason } when n/a).
+ */
+function measurePostWorker(run, assessedAt) {
+  if (run.role?.startsWith("astra")) return null;
+  if (!run.worker_tree || !run.git_root) {
+    return { measured: false, reason: run.schema_version >= 2 ? "no worker snapshot (run not finalized or not a git repo)" : "record predates schema 2" };
+  }
+  if (!fs.existsSync(run.git_root)) return { measured: false, reason: `repo not found: ${run.git_root}` };
+  const nowTree = snapshotTree(run.git_root);
+  const files = (run.touched_files || []).map((f) => path.relative(run.git_root, f).split(path.sep).join("/"));
+  const stat = diffStat(run.git_root, run.worker_tree, nowTree, files);
+  if (!stat) return { measured: false, reason: "git diff failed" };
+  const overlapping = overlappingRuns(run, readAllRuns(), assessedAt);
+  const workerLines = churn(run.worker_patch);
+  return {
+    measured: true,
+    measured_at: assessedAt,
+    current_tree: nowTree,
+    ...stat,
+    rewrite_ratio: workerLines ? Number((churn(stat) / workerLines).toFixed(2)) : null,
+    overlapping_runs: overlapping,
+    // Changes by another worker in the same files can't be told apart from Opus's corrections.
+    attribution: overlapping.length ? "uncertain" : "clean"
+  };
+}
+
+function cmdAbandon(options, positionals) {
+  if (!positionals[0]) fail("abandon <run-id-or-json-path> [--reason <text>]");
+  const run = loadRun(positionals[0]);
+  if (!UNFINALIZED_STATUSES.includes(run.status)) fail(`run ${run.run_id} is '${run.status}'; only running or submitted_background runs can be abandoned`);
+  run.status = "abandoned";
+  run.finished_at = nowIso();
+  run.abandoned_reason = options.reason || null;
+  saveRun(run, "run_abandoned");
+  console.log(`ABANDONED: ${run.run_id} (no longer reserves quota or counts against its budget)`);
   return 0;
 }
 
@@ -807,11 +955,37 @@ function pct(n, d) {
   return d ? Number(((n / d) * 100).toFixed(1)) : 0;
 }
 
+// Run records under a directory tree, e.g. an extracted telemetry pack (all hosts, recursively).
+// Validation runs (runs/_validation) are skipped unless includeValidation is set.
+function readRunsFrom(dir, includeValidation = false) {
+  if (!fs.existsSync(dir)) fail(`--runs-dir not found: ${dir}`);
+  const out = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { if (includeValidation || e.name !== "_validation") walk(p); }
+      else if (e.name.endsWith(".run.json")) {
+        try { out.push(JSON.parse(fs.readFileSync(p, "utf8"))); } catch { /* skip unreadable record */ }
+      }
+    }
+  };
+  walk(dir);
+  // The same run can appear in several packs or host folders; keep one per run id.
+  return [...new Map(out.map((r) => [r.run_id, r])).values()];
+}
+
 function cmdMetrics(options) {
-  let runs = readAllRuns();
+  let runs = options["runs-dir"] ? readRunsFrom(path.resolve(options["runs-dir"]), options.all) : readAllRuns();
+  runs = runs.filter((r) => r.status !== "dry_run");
   if (options.role) runs = runs.filter((r) => r.role === options.role);
   const sinceMs = parseSince(options.since);
   if (sinceMs != null) runs = runs.filter((r) => Date.parse(r.started_at || 0) >= sinceMs);
+  if (options.by) {
+    if (!GROUP_KEYS.includes(options.by)) fail(`--by must be one of: ${GROUP_KEYS.join(", ")}`);
+    const rows = groupMetrics(runs, options.by);
+    console.log(options.json ? JSON.stringify(rows, null, 2) : formatGroupTable(rows, options.by));
+    return 0;
+  }
 
   const completed = runs.filter((r) => ["completed", "git_guard_violation", "failed"].includes(r.status));
   const assessed = runs.filter((r) => r.assessment);
@@ -826,6 +1000,7 @@ function cmdMetrics(options) {
   const reviewFindings = reviewRuns.reduce((s, r) => s + (r.assessment.findings ?? 0), 0);
   const acceptedFindings = reviewRuns.reduce((s, r) => s + (r.assessment.accepted_findings ?? 0), 0);
   const totalDuration = completed.reduce((s, r) => s + (r.duration_ms || 0), 0);
+  const measured = assessed.filter((r) => r.worker_patch && r.post_worker?.measured);
 
   const byRole = {};
   for (const r of runs) {
@@ -871,6 +1046,17 @@ function cmdMetrics(options) {
       findings_total: reviewFindings,
       accepted_findings_total: acceptedFindings,
       finding_acceptance_pct: pct(acceptedFindings, reviewFindings)
+    },
+    attribution: {
+      unfinalized_runs: runs.filter((r) => UNFINALIZED_STATUSES.includes(r.status)).length,
+      verified_accepted: successful.filter((r) => (r.assessment.verified || []).some((v) => v !== "none")).length,
+      causes: Object.fromEntries(VALID_CAUSES.map((c) => [c, assessed.filter((r) => (r.assessment.cause || []).includes(c)).length])),
+      rewrite_measured_runs: measured.length,
+      worker_lines_total: measured.reduce((s, r) => s + churn(r.worker_patch), 0),
+      post_worker_lines_total: measured.reduce((s, r) => s + churn(r.post_worker), 0),
+      worker_report_checks_executed: runs.filter((r) => r.worker_report?.checks_executed).length,
+      worker_report_missing: runs.filter((r) => r.schema_version >= 2 && !r.role?.startsWith("astra")
+        && !UNFINALIZED_STATUSES.includes(r.status) && !r.worker_report).length
     },
     timing: {
       total_duration_ms: totalDuration,
@@ -929,6 +1115,8 @@ switch (command) {
     process.exit(cmdMetrics(options));
   case "collect":
     process.exit(cmdCollect(options, positionals));
+  case "abandon":
+    process.exit(cmdAbandon(options, positionals));
   default:
     fail([
       "usage:",
@@ -941,8 +1129,10 @@ switch (command) {
       "  runs [--json] [--limit <n>] [--role <role>] [--status <status>]",
       "  show <run-id-or-json-path> [--json]",
       "  assess <run-id-or-json-path> --outcome <accepted|minor_rework|major_rework|failed|not_applicable> [--useful <yes|no|mixed>] [--findings <n>] [--accepted-findings <n>] [--rework-rounds <n>] [--notes <text>]",
+      `      [--cause <${VALID_CAUSES.join("|")},...>] [--verified <tests,runtime,visual|none>] [--verified-findings <n>] [--critical-findings <n>]`,
       "  record-skip --task-id <id> --reason <text> [--task-type <type>] [--role <expected-role>] [--parent <id>] [--cwd <dir>]",
-      "  metrics [--json] [--role <role>] [--since <ISO-date-or-days>]",
-      "  collect <run-id-or-json-path> [--wait] [--timeout-ms <ms>]"
+      `  metrics [--json] [--role <role>] [--since <ISO-date-or-days>] [--by <${GROUP_KEYS.join("|")}>] [--runs-dir <dir> [--all]]`,
+      "  collect <run-id-or-json-path> [--wait] [--timeout-ms <ms>]",
+      "  abandon <run-id-or-json-path> [--reason <text>]"
     ].join("\n"));
 }

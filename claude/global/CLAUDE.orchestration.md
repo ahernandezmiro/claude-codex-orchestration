@@ -41,10 +41,14 @@ These flags are stored locally in the run record and never reach the worker, so 
 When a task matches a normal delegation rule but you deliberately keep it, record it:
 `node ~/.claude/orchestration/scripts/codex-delegate.mjs record-skip --task-id <id> --task-type <type> --role <expected-role> --reason "<why>"`
 
-After reviewing each finished run, assess it:
-`node ~/.claude/orchestration/scripts/codex-delegate.mjs assess <run-id> --outcome <…> --useful <yes|no|mixed> [--findings n --accepted-findings n] [--rework-rounds n] --notes "<…>"`
+After reviewing each finished run, and after making your own corrections to its files, assess it:
+`node ~/.claude/orchestration/scripts/codex-delegate.mjs assess <run-id> --outcome <…> --useful <yes|no|mixed> [--cause <…>] --verified <tests,runtime,visual|none> [--findings n --accepted-findings n --verified-findings n --critical-findings n] [--rework-rounds n] --notes "<…>"`
+
+`assess` measures how much of the worker's files you changed after it finished, so run it once your fixes are in. Running it again re-measures. Finalize the run first: `collect` for background runs, or `abandon <run-id> --reason "<…>"` for a run that will never finish.
 
 Don't mark a run useful merely because it completed.
+- `--cause` (any rework or failure, comma-separated): `model_error` (worker got it wrong), `spec_error` (your packet was wrong or contradictory), `test_gap` (required tests not written or not run), `runtime_gap` (unit tests passed but the integrated app/game broke), `visual_fidelity`, `tool_error`, `quota`, `concurrency`.
+- `--verified`: what you re-ran yourself, not what the worker reported. Use `none` if you only read the diff.
 - Luna/Sol `--outcome`:
   - `accepted`: criteria met without substantive correction;
   - `minor_rework`: small fixes were needed;
@@ -52,10 +56,11 @@ Don't mark a run useful merely because it completed.
   - `failed`: no usable result.
 - Astra:
   - `--findings` is the number of actionable findings, and `--accepted-findings` is how many you actually accept.
+  - `--verified-findings`: how many you confirmed with a reproduction, probe or source check. `--critical-findings`: how many would have caused a real defect or data loss.
   - `--useful yes` only if the review materially improved the plan, design, implementation, risk analysis or validation.
   - A review that only says the artifact is fine is normally `--useful no`, unless independent confirmation mattered for a high-risk decision.
 
-Inspect with `runs --limit 20`, `show <run-id>` and `metrics [--role <role>] [--since <days>]`. Telemetry lives in `~/.claude/orchestration/runs/` and `~/.claude/orchestration/telemetry/`.
+Inspect with `runs --limit 20`, `show <run-id>` and `metrics [--role <role>] [--since <days>] [--by project|role|task_type|duration|outcome|cause]`. Telemetry lives in `~/.claude/orchestration/runs/` and `~/.claude/orchestration/telemetry/`.
 
 End substantive engineering responses with one compact line, for example:
 `Orchestration: Opus → Luna implementation → Opus review` or `Orchestration: Opus only — delegation not warranted.`

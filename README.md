@@ -17,6 +17,8 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 | `claude/global/config/quota.json` | **quota-gate threshold per role** | same |
 | `claude/global/scripts/quota-gate.mjs` | Codex quota read + gate, used by the wrapper | `~/.claude/orchestration/scripts/` |
 | `claude/global/scripts/pack-telemetry.mjs` | zips runs + telemetry for offline analysis | `~/.claude/orchestration/scripts/` |
+| `claude/global/scripts/telemetry-lib.mjs` | schema-2 attribution: working-tree snapshots, worker/post-worker diff stats, report parsing, `metrics --by` | same |
+| `claude/global/scripts/opus-usage.mjs` | offline: Claude tokens spent between each worker result and its assessment, from local session transcripts | same |
 | `claude/global/config/models.local.json` | optional per-machine override (gitignored) | same, if present |
 | `claude/global/agents/*.md` | `luna-worker`, `astra-reviewer` subagents | `~/.claude/agents/` |
 | `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | managed block in `~/.claude/CLAUDE.md` |
