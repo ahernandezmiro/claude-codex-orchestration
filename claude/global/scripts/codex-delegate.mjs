@@ -231,6 +231,12 @@ function findCompanion() {
       for (const plugin of subdirs(path.join(account, "rpm"))) pushIfPlugin(plugin);
     }
   }
+  // Newer desktop layout: Claude/rpm/<org>/<account>/<plugin>
+  for (const org of subdirs(path.join(appData, "Claude", "rpm"))) {
+    for (const account of subdirs(org)) {
+      for (const plugin of subdirs(account)) pushIfPlugin(plugin);
+    }
+  }
   // Claude Code CLI marketplace installs: ~/.claude/plugins/cache/<marketplace>/codex/<version>
   for (const marketplace of subdirs(path.join(os.homedir(), ".claude", "plugins", "cache"))) {
     for (const version of subdirs(path.join(marketplace, "codex"))) pushIfPlugin(version);
