@@ -16,12 +16,13 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 | `claude/global/config/models.json` | **model + default effort per role** | `~/.claude/orchestration/config/` |
 | `claude/global/config/quota.json` | **quota-gate threshold per role** | same |
 | `claude/global/scripts/quota-gate.mjs` | Codex quota read + gate, used by the wrapper | `~/.claude/orchestration/scripts/` |
+| `claude/global/scripts/pack-telemetry.mjs` | zips runs + telemetry for offline analysis | `~/.claude/orchestration/scripts/` |
 | `claude/global/config/models.local.json` | optional per-machine override (gitignored) | same, if present |
 | `claude/global/agents/*.md` | `luna-worker`, `astra-reviewer` subagents | `~/.claude/agents/` |
 | `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | managed block in `~/.claude/CLAUDE.md` |
 | `claude/global/settings.permissions.json` | allow/ask rules | merged into `~/.claude/settings.json` |
 | `claude/global/install.mjs` | cross-platform installer | — |
-| `claude/global/test/` | validation packets, playground creator, prompt-freeze guard + golden prompts, quota-gate tests | — |
+| `claude/global/test/` | validation packets, playground creator, prompt-freeze guard + golden prompts, quota-gate and packer tests | — |
 | `deploy.ps1` / `deploy.sh` | deploy entry points for Windows / Linux-WSL | — |
 
 ## Deploy (fresh install or update)
@@ -99,6 +100,21 @@ Example: 60% remaining with one Astra and one Luna in flight leaves 60 − 25 �
 - Environment variables: `CODEX_BIN` sets the codex binary. `CODEX_QUOTA_SNAPSHOT=<file.json>` (`{usedPercent, windowMinutes, resetsAt}`) replaces the live read; the tests use it.
 - Tests: `node --test claude/global/test/quota-gate.test.mjs`.
 
+## Exporting telemetry for analysis
+
+`pack-telemetry.mjs` writes one zip with everything the evaluation produced on a machine:
+
+```bash
+node ~/.claude/orchestration/scripts/pack-telemetry.mjs
+```
+
+- **Where it reads:** `<home>/.claude/orchestration`, the root `install.mjs` deploys to: `%USERPROFILE%\.claude\orchestration` on Windows, `~/.claude/orchestration` on Linux/WSL. `--source <dir>` (repeatable) packs other dirs instead.
+- **Both sides of a Windows + WSL machine:** `--all-hosts` adds every WSL distro's `/home/*/.claude/orchestration` when run on Windows (via `\\wsl.localhost`; this boots a stopped distro), or every `/mnt/<drive>/Users/*/.claude/orchestration` when run in WSL.
+- **What goes in:** `manifest.json` (sources, file/run/event counts, options), then one folder per source (`<host>-<platform>-<user>/`) with `runs/`, `telemetry/`, `deployed.json` and `config/*.json`. Kit files (scripts, prompts, templates) are not included.
+- **Trimming:** `--exclude-raw` drops `*.prompt.md`, `*.stdout.txt` and `*.stderr.txt`, which can hold project code; run records and events keep every metric. `--exclude-validation` drops `runs/_validation/` and `telemetry/_validation/`.
+- **Output:** `./orchestration-telemetry-<host>-<timestamp>.zip`, or `--out <file.zip>`. `--dry-run` prints the summary without writing. Zips are gitignored.
+- Tests: `node --test claude/global/test/pack-telemetry.test.mjs`.
+
 ## Prompt freeze (evaluation period)
 
 Telemetry compares delegations over time, so the prompts must not change while model and effort selection does. `node claude/global/test/prompt-freeze.mjs` checks two things:
@@ -111,4 +127,4 @@ When the evaluation is closed and prompts may change: edit them, run `node claud
 
 ## What is not tracked
 
-`.gitignore` excludes delegation runs and telemetry (`runs/`, `telemetry/`, `*.run.json`, `*.prompt.md`, `*.jsonl`, …), `.orchestration/` work products, playgrounds, Claude/Codex session and conversation state (`.claude/`, `.codex/`, transcripts), installer backups (`*.bak-*`), per-machine `models.local.json`, and editor/OS files. Only setup sources belong in the repo.
+`.gitignore` excludes delegation runs and telemetry (`runs/`, `telemetry/`, `*.run.json`, `*.prompt.md`, `*.jsonl`, …), `.orchestration/` work products, playgrounds, Claude/Codex session and conversation state (`.claude/`, `.codex/`, transcripts), installer backups (`*.bak-*`), telemetry exports (`orchestration-telemetry-*.zip`), per-machine `models.local.json`, and editor/OS files. Only setup sources belong in the repo.
