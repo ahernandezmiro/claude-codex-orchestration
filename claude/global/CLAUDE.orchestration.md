@@ -23,6 +23,7 @@ Steps:
 3. Dispatch with the `luna-worker` or `astra-reviewer` subagent (pass packet path, role, and target repo dir), or run the wrapper yourself with the Bash tool:
    `node ~/.claude/orchestration/scripts/codex-delegate.mjs run --role <role> --packet <file> --cwd <repo> [--background]`
 4. Long tasks: use `--background`, then `node ~/.claude/orchestration/scripts/codex-delegate.mjs collect <run-id> --wait`. That prints the result, runs the git guard and finalizes telemetry. The run id is printed as `DELEGATE: run=…`. The plugin's `/codex:status` and `/codex:result` show the same jobs.
+   Isolation: add `--worktree [--base <ref>]` when another worker or your own edits will touch the same repo while this run is in flight. The worker then runs in `<repo>-wt/<task>-<stamp>` on branch `orch/<task>-<stamp>`, starting from `<base>` (default HEAD), so it won't see uncommitted changes in the main checkout. After review, `worktree-apply <run-id>` copies its changes into the main checkout, unstaged. Make corrections there, then `assess`, then `worktree-clean <run-id>`.
 5. Review the result yourself: run the required checks, read the diff. A worker's report is evidence, not truth.
 6. Record your assessment with `assess` (see below).
 

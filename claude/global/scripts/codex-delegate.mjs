@@ -6,7 +6,8 @@
 //   ~/.claude/orchestration/scripts/codex-delegate.mjs
 //
 // Core usage (backward-compatible):
-//   node codex-delegate.mjs run --role <role> --packet <file.yaml> [--cwd <repo>] [--background] [--effort <e>] [--dry-run]
+//   node codex-delegate.mjs run --role <role> --packet <file.yaml> [--cwd <repo>] [--background] [--effort <e>] [--dry-run] [--worktree] [--base <ref>]
+//   node codex-delegate.mjs worktree-apply <run-id> | worktree-clean <run-id> [--force]
 //   node codex-delegate.mjs status [job-id] [--wait] [--timeout-ms <ms>] [--cwd <repo>]
 //   node codex-delegate.mjs result [job-id]
 //   node codex-delegate.mjs cancel [job-id]
@@ -164,7 +165,7 @@ function parseArgs(argv) {
       continue;
     }
     const key = arg.slice(2);
-    if (["background", "dry-run", "json", "wait", "all"].includes(key)) {
+    if (["background", "dry-run", "json", "wait", "all", "worktree", "force"].includes(key)) {
       options[key] = true;
     } else {
       if (i + 1 >= argv.length) fail(`missing value for --${key}`);
@@ -278,9 +279,15 @@ function git(cwd, args) {
   return r.status === 0 ? r.stdout.trimEnd() : null;
 }
 
+function gitInput(cwd, args, input) {
+  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", input, maxBuffer: 256 * 1024 * 1024 });
+  return { status: r.status ?? 1, stdout: r.stdout || "", stderr: r.stderr || "" };
+}
+
 function gitSnapshot(cwd) {
-  const root = git(cwd, ["rev-parse", "--show-toplevel"]);
-  if (!root) return null;
+  const resolvedRoot = git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (!resolvedRoot) return null;
+  const root = path.resolve(resolvedRoot);
   return {
     root,
     head: git(root, ["rev-parse", "-q", "--verify", "HEAD"]),
@@ -303,13 +310,20 @@ function gitChangedFiles(cwd) {
   return porcelainFiles(git(root, ["status", "--porcelain=v1"]));
 }
 
-function verifyGit(baseline, { quiet = false } = {}) {
+function verifyGit(baseline, { quiet = false, worktree = null } = {}) {
   if (!baseline) {
     if (!quiet) console.log("GIT GUARD: n/a (not a git repository)");
     return { ok: true, changed: [], now: null };
   }
   const now = gitSnapshot(baseline.root);
-  const changed = ["head", "branch", "refs", "remotes", "stashes"].filter((k) => (now?.[k] ?? null) !== baseline[k]);
+  let changed;
+  if (worktree) {
+    const branchRef = `refs/heads/${worktree.branch}`;
+    const relevantRefs = (value) => (value || "").split(/\r?\n/).filter(Boolean)
+      .filter((line) => !line.startsWith("refs/heads/") || line.startsWith(`${branchRef} `)).join("\n");
+    changed = ["head", "branch", "remotes", "stashes"].filter((k) => (now?.[k] ?? null) !== baseline[k]);
+    if (relevantRefs(now?.refs) !== relevantRefs(baseline.refs)) changed.push("refs");
+  } else changed = ["head", "branch", "refs", "remotes", "stashes"].filter((k) => (now?.[k] ?? null) !== baseline[k]);
   if (changed.length === 0) {
     if (!quiet) console.log("GIT GUARD: OK (no commits, branch, ref, remote or stash changes)");
     return { ok: true, changed, now };
@@ -523,7 +537,7 @@ async function cmdRun(options) {
   if (!options.packet) fail("--packet <file> is required");
   const packetPath = path.resolve(options.packet);
   if (!fs.existsSync(packetPath)) fail(`packet not found: ${packetPath}`);
-  const cwd = path.resolve(options.cwd || process.cwd());
+  let cwd = path.resolve(options.cwd || process.cwd());
   if (!fs.existsSync(cwd)) fail(`--cwd does not exist: ${cwd}`);
   const { model, effort: configuredEffort } = loadModelSelection().selection[roleName];
   const effort = options.effort || configuredEffort;
@@ -558,6 +572,30 @@ async function cmdRun(options) {
   const runFile = runJsonPath(base);
   fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText));
 
+  let worktree = null;
+  if (options.worktree && !options["dry-run"]) {
+    const main = git(cwd, ["rev-parse", "--show-toplevel"]);
+    if (!main) fail("--worktree requires --cwd inside a git repository");
+    const mainRoot = path.resolve(main);
+    const dirty = git(mainRoot, ["status", "--porcelain=v1"]) || "";
+    const stampWt = nowIso().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const suffix = `${taskId}-${stampWt}`;
+    const branch = `orch/${suffix}`;
+    const wtPath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}-wt`, suffix);
+    const baseRef = options.base || "HEAD";
+    const baseCommit = git(mainRoot, ["rev-parse", `${baseRef}^{commit}`]);
+    if (!baseCommit) fail(`could not resolve worktree base '${baseRef}'`);
+    const add = gitInput(mainRoot, ["worktree", "add", "-b", branch, wtPath, baseRef]);
+    if (add.status !== 0) fail(`could not create worktree: ${add.stderr.trim()}`);
+    if (dirty) console.log(`WORKTREE: main checkout has ${dirty.split(/\r?\n/).filter(Boolean).length} uncommitted change(s); the worker starts from ${baseRef} and will not see them.`);
+    console.log(`WORKTREE: ${wtPath} (branch ${branch}, base ${baseCommit.slice(0, 8)})`);
+    const relative = path.relative(mainRoot, cwd);
+    cwd = relative ? path.join(wtPath, relative) : wtPath;
+    worktree = { path: wtPath, branch, base: baseRef, base_commit: baseCommit, main_root: mainRoot,
+      created_at: nowIso(), applied_at: null, applied_tree: null, pre_apply: null, cleaned_at: null };
+  } else if (options.worktree && !git(cwd, ["rev-parse", "--show-toplevel"])) {
+    fail("--worktree requires --cwd inside a git repository");
+  }
   const baseline = gitSnapshot(cwd);
   // Content snapshot for attribution; dry runs never reach a worker, so they skip the hashing cost.
   if (baseline && !options["dry-run"]) baseline.tree = snapshotTree(baseline.root);
@@ -621,6 +659,7 @@ async function cmdRun(options) {
     collected_at: null,
     assessment: null
   };
+  if (worktree) run.worktree = worktree;
   saveRun(run, "run_started");
 
   console.log(`DELEGATE: run=${run.run_id}`);
@@ -659,7 +698,7 @@ async function cmdRun(options) {
   fs.writeFileSync(stdoutFile, result.stdout);
   fs.writeFileSync(stderrFile, result.stderr);
 
-  const guard = verifyGit(baseline);
+  const guard = verifyGit(baseline, { worktree });
   run.companion_path = result.companion;
   run.companion_status = result.status;
   run.companion_signal = result.signal;
@@ -728,7 +767,7 @@ function cmdCollect(options, positionals) {
   mirror(output.endsWith("\n") ? output : `${output}\n`);
 
   const baseline = JSON.parse(fs.readFileSync(run.git_baseline_file, "utf8"));
-  const guard = verifyGit(baseline);
+  const guard = verifyGit(baseline, { worktree: run.worktree });
   run.git_guard = { ok: guard.ok, changed: guard.changed };
   run.changed_files_after = gitChangedFiles(run.cwd);
   run.companion_status = job.result?.status ?? null;
@@ -828,6 +867,7 @@ function cmdShow(options, positionals) {
     failure_hint: run.failure_hint,
     assessment: run.assessment,
     post_worker: run.post_worker,
+    worktree: run.worktree,
     prompt_file: run.prompt_file,
     stdout_file: run.stdout_file,
     stderr_file: run.stderr_file
@@ -909,6 +949,24 @@ function measurePostWorker(run, assessedAt) {
     return { measured: false, reason: run.schema_version >= 2 ? "no worker snapshot (run not finalized or not a git repo)" : "record predates schema 2" };
   }
   if (!fs.existsSync(run.git_root)) return { measured: false, reason: `repo not found: ${run.git_root}` };
+  if (run.worktree) {
+    const wt = run.worktree;
+    if (!fs.existsSync(wt.main_root) || !fs.existsSync(wt.path)) return { measured: false, reason: "worktree or main checkout not found" };
+    const files = (run.touched_files || []).map((f) => path.relative(run.git_root, f).split(path.sep).join("/"));
+    if (wt.applied_at) {
+      const nowTree = snapshotTree(wt.main_root);
+      const after = diffStat(wt.main_root, wt.applied_tree, nowTree, files);
+      if (!after) return { measured: false, reason: "git diff failed" };
+      // Field-wise sum intentionally permits a file touched before and after apply to count twice.
+      const stat = Object.fromEntries(["files", "lines_added", "lines_removed", "binary_files"]
+        .map((key) => [key, (wt.pre_apply?.[key] || 0) + (after[key] || 0)]));
+      const overlapping = overlappingRuns(run, readAllRuns(), assessedAt);
+      const workerLines = churn(run.worker_patch);
+      return { measured: true, measured_at: assessedAt, current_tree: nowTree, ...stat,
+        rewrite_ratio: workerLines ? Number((churn(stat) / workerLines).toFixed(2)) : null,
+        overlapping_runs: overlapping, attribution: overlapping.length ? "uncertain" : "clean" };
+    }
+  }
   const nowTree = snapshotTree(run.git_root);
   const files = (run.touched_files || []).map((f) => path.relative(run.git_root, f).split(path.sep).join("/"));
   const stat = diffStat(run.git_root, run.worker_tree, nowTree, files);
@@ -925,6 +983,48 @@ function measurePostWorker(run, assessedAt) {
     // Changes by another worker in the same files can't be told apart from Opus's corrections.
     attribution: overlapping.length ? "uncertain" : "clean"
   };
+}
+
+/** Apply or discard a recorded worker worktree. Input: command, run id, options. Output: exit code. */
+function cmdWorktree(command, options, positionals) {
+  if (!positionals[0]) fail(`${command} <run-id> ${command === "worktree-clean" ? "[--force]" : ""}`);
+  const run = loadRun(positionals[0]);
+  const wt = run.worktree;
+  if (!wt) fail(`run ${run.run_id} has no worktree`);
+  if (command === "worktree-apply") {
+    if (wt.applied_at) fail(`run ${run.run_id} worktree is already applied`);
+    if (UNFINALIZED_STATUSES.includes(run.status)) fail(`run ${run.run_id} is not finalized`);
+    if (!fs.existsSync(wt.path) || !fs.existsSync(wt.main_root)) fail("worktree or main checkout not found");
+    const current = snapshotTree(wt.path);
+    const files = (run.touched_files || []).map((f) => path.relative(wt.path, f).split(path.sep).join("/"));
+    const pre = diffStat(wt.path, run.worker_tree, current, files);
+    const patch = gitInput(wt.path, ["diff", "--binary", run.baseline_tree, current]);
+    if (patch.status !== 0) fail(patch.stderr.trim(), 1);
+    const applied = gitInput(wt.main_root, ["apply", "--whitespace=nowarn"], patch.stdout);
+    if (applied.status !== 0) { process.stderr.write(applied.stderr); return 1; }
+    wt.pre_apply = pre;
+    wt.applied_at = nowIso();
+    wt.applied_tree = snapshotTree(wt.main_root);
+    saveRun(run, "run_worktree_applied");
+    // Count the files in the patch itself; the main tree may hold unrelated uncommitted changes.
+    const appliedFiles = changedPaths(wt.path, run.baseline_tree, current).length;
+    console.log(`APPLIED: ${appliedFiles} file(s) into ${wt.main_root}`);
+    return 0;
+  }
+  if (wt.cleaned_at) fail(`run ${run.run_id} worktree is already cleaned`);
+  const dirty = git(wt.path, ["status", "--porcelain=v1"]) || "";
+  const head = git(wt.path, ["rev-parse", "HEAD"]);
+  const unmerged = head && git(wt.main_root, ["rev-list", "--count", `${wt.base_commit}..${head}`]);
+  if (!options.force && ((dirty && !wt.applied_at) || Number(unmerged) > 0)) fail("refusing to remove unapplied worktree changes or commits; use --force");
+  // Once applied, the recorded tree is already in the main checkout, so remove the residual worker tree.
+  const remove = gitInput(wt.main_root, ["worktree", "remove", ...(options.force || wt.applied_at ? ["--force"] : []), wt.path]);
+  if (remove.status !== 0) fail(remove.stderr.trim(), 1);
+  const branch = gitInput(wt.main_root, ["branch", "-D", wt.branch]);
+  if (branch.status !== 0) fail(branch.stderr.trim(), 1);
+  wt.cleaned_at = nowIso();
+  saveRun(run, "run_worktree_cleaned");
+  console.log(`CLEANED: ${wt.path}`);
+  return 0;
 }
 
 function cmdAbandon(options, positionals) {
@@ -1123,10 +1223,13 @@ switch (command) {
     process.exit(cmdCollect(options, positionals));
   case "abandon":
     process.exit(cmdAbandon(options, positionals));
+  case "worktree-apply":
+  case "worktree-clean":
+    process.exit(cmdWorktree(command, options, positionals));
   default:
     fail([
       "usage:",
-      "  run --role <role> --packet <file> [--cwd <dir>] [--background] [--effort <e>] [--reason <text>] [--task-type <type>] [--parent <id>] [--attempt <n>] [--budget-key <key>] [--max-attempts <n>] [--dry-run]",
+      "  run --role <role> --packet <file> [--cwd <dir>] [--background] [--effort <e>] [--reason <text>] [--task-type <type>] [--parent <id>] [--attempt <n>] [--budget-key <key>] [--max-attempts <n>] [--dry-run] [--worktree] [--base <ref>]",
       "  status|result|cancel [job-id] [--cwd <dir>] [--wait] [--timeout-ms <ms>]",
       "  verify-git <baseline.json>",
       "  which",
@@ -1139,6 +1242,8 @@ switch (command) {
       "  record-skip --task-id <id> --reason <text> [--task-type <type>] [--role <expected-role>] [--parent <id>] [--cwd <dir>]",
       `  metrics [--json] [--role <role>] [--since <ISO-date-or-days>] [--by <${GROUP_KEYS.join("|")}>] [--runs-dir <dir> [--all]]`,
       "  collect <run-id-or-json-path> [--wait] [--timeout-ms <ms>]",
-      "  abandon <run-id-or-json-path> [--reason <text>]"
+      "  abandon <run-id-or-json-path> [--reason <text>]",
+      "  worktree-apply <run-id>",
+      "  worktree-clean <run-id> [--force]",
     ].join("\n"));
 }

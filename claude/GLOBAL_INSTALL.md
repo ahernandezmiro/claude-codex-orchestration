@@ -95,7 +95,7 @@ Source files in the kit (`claude/global/`), with where the installer copies them
 
 | Kit source | Installed to | Purpose |
 |---|---|---|
-| `scripts/codex-delegate.mjs` | `~/.claude/orchestration/scripts/` | role-pinned delegation, blind-review key filter, git guard, telemetry; commands `run/status/result/cancel/collect/abandon/verify-git/which/runs/show/assess/record-skip/metrics`; uses `telemetry-lib.mjs` for tree snapshots and attribution |
+| `scripts/codex-delegate.mjs` | `~/.claude/orchestration/scripts/` | role-pinned delegation, blind-review key filter, git guard, telemetry; commands `run/status/result/cancel/collect/abandon/worktree-apply/worktree-clean/verify-git/which/runs/show/assess/record-skip/metrics`; uses `telemetry-lib.mjs` for tree snapshots and attribution |
 | `agents/luna-worker.md` | `~/.claude/agents/` | forwards a task packet to `luna-implement` / `luna-test` / `sol-implement` |
 | `agents/astra-reviewer.md` | `~/.claude/agents/` | forwards a review packet to `astra-review` / `astra-investigate` |
 | `templates/task-packet.yaml`, `review-packet.yaml` | `~/.claude/orchestration/templates/` | packet starting points |
