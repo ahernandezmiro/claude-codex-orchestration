@@ -53,6 +53,7 @@
 // - No external packages are required.
 
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -144,6 +145,87 @@ function loadModelSelection() {
     if (!VALID_EFFORTS.includes(effort)) fail(`role '${roleName}' effort must be one of: ${VALID_EFFORTS.join(", ")} (got ${JSON.stringify(effort)})`);
   }
   return { selection, sources };
+}
+
+/**
+ * Find and validate the nearest project defaults file without crossing the repository root.
+ * Input: original run cwd. Output: null or { file, sha256, config }.
+ */
+function findProjectConfig(startDir) {
+  const start = path.resolve(startDir);
+  const rootValue = git(start, ["rev-parse", "--show-toplevel"]);
+  const root = rootValue ? path.resolve(rootValue) : start;
+  let dir = start;
+  let file = null;
+  while (true) {
+    const candidate = path.join(dir, ".orchestration", "project.json");
+    if (fs.existsSync(candidate)) { file = candidate; break; }
+    if (dir === root || dir === path.dirname(dir)) break;
+    dir = path.dirname(dir);
+  }
+  if (!file) return null;
+  let config;
+  const bytes = fs.readFileSync(file);
+  try { config = JSON.parse(bytes.toString("utf8")); }
+  catch (e) { fail(`invalid project config ${file}: ${e.message}`); }
+  const problem = (message) => fail(`invalid project config ${file}: ${message}`);
+  if (!config || Array.isArray(config) || typeof config !== "object") problem("expected a JSON object");
+  const known = new Set(["schema_version", "constraints", "required_checks", "context", "roles", "review_safe"]);
+  for (const key of Object.keys(config)) if (!known.has(key)) problem(`unknown key '${key}'`);
+  if (config.schema_version !== 1) problem("schema_version must be 1");
+  for (const key of ["constraints", "required_checks"]) {
+    if (Object.hasOwn(config, key) && (!Array.isArray(config[key]) || config[key].some((item) => typeof item !== "string")))
+      problem(`${key} must be an array of strings`);
+  }
+  if (Object.hasOwn(config, "context") && typeof config.context !== "string") problem("context must be a string");
+  if (Object.hasOwn(config, "review_safe") && typeof config.review_safe !== "boolean") problem("review_safe must be a boolean");
+  if (Object.hasOwn(config, "roles") && (!config.roles || Array.isArray(config.roles) || typeof config.roles !== "object")) problem("roles must be an object");
+  for (const [roleName, values] of Object.entries(config.roles || {})) {
+    if (!Object.hasOwn(ROLES, roleName)) problem(`unknown role '${roleName}'`);
+    if (!values || Array.isArray(values) || typeof values !== "object") problem(`roles.${roleName} must be an object`);
+    for (const key of Object.keys(values)) if (!["model", "effort"].includes(key)) problem(`roles.${roleName} has unknown key '${key}'`);
+    if (Object.hasOwn(values, "model") && (typeof values.model !== "string" || !values.model.trim())) problem(`roles.${roleName}.model must be a non-empty string`);
+    if (Object.hasOwn(values, "effort") && !VALID_EFFORTS.includes(values.effort)) problem(`roles.${roleName}.effort must be one of: ${VALID_EFFORTS.join(", ")}`);
+  }
+  return { file, sha256: crypto.createHash("sha256").update(bytes).digest("hex"), config };
+}
+
+/**
+ * Add project constraints, checks and context to parsed packet blocks.
+ * Input: splitTopLevel blocks, validated config, role name. Output: { blocks, applied }.
+ */
+function applyProjectDefaults(blocks, project, roleName) {
+  const applied = { constraints: 0, required_checks: 0, context: false };
+  if (!project) return { blocks, applied };
+  const config = project.config;
+  const astra = roleName.startsWith("astra-");
+  const next = [...blocks];
+  if (!astra) {
+    for (const key of ["constraints", "required_checks"]) {
+      const items = config[key] || [];
+      if (!items.length) continue;
+      const index = next.findIndex((block) => block.key === key);
+      if (index < 0) next.push({ key, text: `${key}:\n${items.map((item) => `  - ${JSON.stringify(item)}`).join("\n")}` });
+      else {
+        const lines = next[index].text.split(/\r?\n/);
+        const itemLines = lines.slice(1).filter((line) => line.trim() && !line.trim().startsWith("#"));
+        // YAML allows list items at column 0 or indented; reuse the packet's own indentation.
+        const indent = itemLines[0]?.match(/^(\s*)- /)?.[1] ?? "  ";
+        if (lines[0].trimEnd() !== `${key}:` || itemLines.some((line) => !line.startsWith(`${indent}- `) && !line.startsWith(`${indent}  `)))
+          fail(`packet ${key} must be a block list to receive project defaults`);
+        next[index] = { key, text: `${next[index].text}\n${items.map((item) => `${indent}- ${JSON.stringify(item)}`).join("\n")}` };
+      }
+      applied[key] = items.length;
+    }
+    if (config.context) {
+      next.push({ key: "project_context", text: `project_context: |\n${config.context.split(/\r?\n/).map((line) => `  ${line}`).join("\n")}` });
+      applied.context = true;
+    }
+  } else if (config.review_safe === true && config.context) {
+    next.push({ key: "project_context", text: `project_context: |\n${config.context.split(/\r?\n/).map((line) => `  ${line}`).join("\n")}` });
+    applied.context = true;
+  }
+  return { blocks: next, applied };
 }
 
 function ensureDirs() {
@@ -534,15 +616,21 @@ async function cmdQuota(options) {
 
 async function cmdRun(options) {
   const roleName = options.role;
-  const role = ROLES[roleName];
+  let role = ROLES[roleName];
   if (!role) fail(`--role must be one of: ${Object.keys(ROLES).join(", ")}`);
   if (!options.packet) fail("--packet <file> is required");
   const packetPath = path.resolve(options.packet);
   if (!fs.existsSync(packetPath)) fail(`packet not found: ${packetPath}`);
   let cwd = path.resolve(options.cwd || process.cwd());
   if (!fs.existsSync(cwd)) fail(`--cwd does not exist: ${cwd}`);
-  const { model, effort: configuredEffort } = loadModelSelection().selection[roleName];
+  const project = findProjectConfig(cwd);
+  const modelSelection = loadModelSelection().selection[roleName];
+  const projectRole = project?.config.roles?.[roleName] || {};
+  const model = projectRole.model || modelSelection.model;
+  const configuredEffort = projectRole.effort || modelSelection.effort;
   const effort = options.effort || configuredEffort;
+  const modelSource = projectRole.model ? "project" : "config";
+  const effortSource = options.effort ? "cli" : projectRole.effort ? "project" : "config";
   if (!VALID_EFFORTS.includes(effort)) fail(`--effort must be one of: ${VALID_EFFORTS.join(", ")}`);
   let blocks = splitTopLevel(fs.readFileSync(packetPath, "utf8"));
   const missing = role.required.filter((k) => !blocks.some((b) => b.key === k));
@@ -554,6 +642,12 @@ async function cmdRun(options) {
     strippedKeys = blocks.filter((b) => !role.allowed.includes(b.key)).map((b) => b.key);
     if (strippedKeys.length) console.log(`BLIND REVIEW: stripped non-allowed packet keys: ${strippedKeys.join(", ")}`);
     blocks = blocks.filter((b) => role.allowed.includes(b.key));
+  }
+  const projectApplied = applyProjectDefaults(blocks, project, roleName);
+  blocks = projectApplied.blocks;
+  if (projectApplied.applied.context && roleName.startsWith("astra-")) {
+    // Permit only this generated key for this run; the static blind-review allowlist stays frozen.
+    role = { ...role, allowed: [...(role.allowed || []), "project_context"] };
   }
   const packetText = blocks.map((b) => b.text).join("\n");
   const backend = options.backend || process.env.ORCH_BACKEND || "exec";
@@ -576,6 +670,7 @@ async function cmdRun(options) {
   const baselineFile = `${base}.git-baseline.json`;
   const runFile = runJsonPath(base);
   fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText));
+  const promptSha256 = crypto.createHash("sha256").update(fs.readFileSync(promptFile)).digest("hex");
 
   let worktree = null;
   if (options.worktree && !options["dry-run"]) {
@@ -620,7 +715,9 @@ async function cmdRun(options) {
     role: roleName,
     worker: role.worker,
     model,
+    model_source: modelSource,
     effort,
+    effort_source: effortSource,
     sandbox: role.write ? "workspace-write" : "read-only",
     cwd,
     packet_file: packetPath,
@@ -659,6 +756,10 @@ async function cmdRun(options) {
     touched_files_source: null,
     worker_patch: null,
     required_checks_count: countListItems(blocks.find((b) => b.key === "required_checks")?.text),
+    project_config: project ? { file: project.file, sha256: project.sha256, schema_version: 1, applied: {
+      ...projectApplied.applied, model: Boolean(projectRole.model), effort: Boolean(projectRole.effort)
+    } } : null,
+    prompt_sha256: promptSha256,
     worker_report: null,
     failure_hint: null,
     submission_ms: null,
@@ -673,6 +774,10 @@ async function cmdRun(options) {
   console.log(`DELEGATE: role=${roleName} model=${model} effort=${effort} sandbox=${run.sandbox} cwd=${cwd}`);
   if (run.reason) console.log(`DELEGATE: reason=${run.reason}`);
   console.log(`DELEGATE: prompt=${promptFile}`);
+  if (project) {
+    const overrides = [projectRole.model && "model", projectRole.effort && "effort"].filter(Boolean).join(", ") || "none";
+    console.log(`PROJECT: ${project.file} (+${projectApplied.applied.constraints} constraints, +${projectApplied.applied.required_checks} checks, context ${projectApplied.applied.context ? "yes" : "no"}, overrides: ${overrides})`);
+  }
 
   if (options["dry-run"]) {
     if (backend === "exec") {
@@ -1044,6 +1149,45 @@ function cmdRuns(options) {
   if (unfinalized.length) {
     console.log(`\n${unfinalized.length} run(s) not finalized (running/submitted_background). Use collect, or abandon for orphans:`);
     for (const r of unfinalized) console.log(`  ${r.status}\t${r.run_id}`);
+  }
+  return 0;
+}
+
+/**
+ * Explain effective per-role settings and project packet additions without delegating.
+ * Input: role positional, optional --cwd and --json. Output: exit code, with no quota check.
+ */
+function cmdConfigExplain(options, positionals) {
+  const roleName = positionals[0];
+  if (!roleName || !ROLES[roleName]) fail(`config --explain <role> [--cwd <dir>] [--json]; role must be one of: ${Object.keys(ROLES).join(", ")}`);
+  const cwd = path.resolve(options.cwd || process.cwd());
+  if (!fs.existsSync(cwd)) fail(`--cwd does not exist: ${cwd}`);
+  const project = findProjectConfig(cwd);
+  const configured = loadModelSelection().selection[roleName];
+  const projectRole = project?.config.roles?.[roleName] || {};
+  const result = {
+    role: roleName,
+    model: projectRole.model || configured.model,
+    model_source: projectRole.model ? "project" : "config",
+    effort: projectRole.effort || configured.effort,
+    effort_source: projectRole.effort ? "project" : "config",
+    project_file: project?.file || "none",
+    constraints: roleName.startsWith("astra-") ? [] : (project?.config.constraints || []),
+    required_checks: roleName.startsWith("astra-") ? [] : (project?.config.required_checks || []),
+    context: project && project.config.context && (!roleName.startsWith("astra-") || project.config.review_safe === true)
+      ? project.config.context : null,
+    review_safe_applies: roleName.startsWith("astra-") ? project?.config.review_safe === true : null
+  };
+  if (options.json) console.log(JSON.stringify(result, null, 2));
+  else {
+    console.log(`role: ${result.role}`);
+    console.log(`model: ${result.model} (source: ${result.model_source})`);
+    console.log(`effort: ${result.effort} (source: ${result.effort_source})`);
+    console.log(`project file: ${result.project_file}`);
+    console.log(`constraints: ${JSON.stringify(result.constraints)}`);
+    console.log(`required_checks: ${JSON.stringify(result.required_checks)}`);
+    console.log(`context: ${result.context == null ? "none" : JSON.stringify(result.context)}`);
+    if (result.review_safe_applies != null) console.log(`review_safe applies: ${result.review_safe_applies ? "yes" : "no"}`);
   }
   return 0;
 }
@@ -1434,6 +1578,9 @@ switch (command) {
     }
     process.exit(0);
   }
+  case "config":
+    if (!options.explain) fail("config --explain <role> [--cwd <dir>] [--json]");
+    process.exit(cmdConfigExplain(options, [options.explain, ...positionals]));
   case "runs":
     process.exit(cmdRuns(options));
   case "show":
@@ -1459,6 +1606,7 @@ switch (command) {
       "  verify-git <baseline.json>",
       "  which",
       "  models [--json]",
+      "  config --explain <role> [--cwd <dir>] [--json]",
       "  quota [--role <role>] [--json]",
       "  runs [--json] [--limit <n>] [--role <role>] [--status <status>]",
       "  show <run-id-or-json-path> [--json]",

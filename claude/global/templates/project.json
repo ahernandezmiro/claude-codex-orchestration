@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "constraints": [
+    "Never claim runtime success from unit tests alone; run the engine smoke test."
+  ],
+  "required_checks": [
+    "godot --headless --path . --quit"
+  ],
+  "context": "Godot 4.x project. GDScript unless the task says C#. Preserve scene ownership and signal contracts.",
+  "roles": {
+    "luna-implement": { "effort": "high" }
+  },
+  "review_safe": false
+}

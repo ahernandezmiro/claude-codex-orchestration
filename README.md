@@ -20,6 +20,7 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 | `claude/global/scripts/telemetry-lib.mjs` | schema-2 attribution: working-tree snapshots, worker/post-worker diff stats, report parsing, `metrics --by` | same |
 | `claude/global/scripts/opus-usage.mjs` | offline: Claude tokens spent between each worker result and its assessment, from local session transcripts | same |
 | `claude/global/scripts/exec-backend.mjs`, `exec-runner.mjs` | default backend: shell-free `codex exec` resolution and argv, detached job runner with atomic state, event normalization, verified cancel | same |
+| `claude/global/templates/project.json` | example per-project defaults (`<repo>/.orchestration/project.json`) | `~/.claude/orchestration/templates/` |
 | `claude/global/config/models.local.json` | optional per-machine override (gitignored) | same, if present |
 | `claude/global/agents/*.md` | `luna-worker`, `astra-reviewer` subagents | `~/.claude/agents/` |
 | `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | managed block in `~/.claude/CLAUDE.md` |
@@ -79,6 +80,17 @@ What a deploy does:
 - **Check the model works first.** The Codex cache can list models your account or CLI still rejects. Before switching, run `codex exec --skip-git-repo-check --sandbox read-only --model <id> "Reply OK"`.
 
 Roles themselves (prompt, sandbox, contract, required packet keys, blind-review allowlist) stay in `codex-delegate.mjs` and are not configurable. In particular, the worker display name in the prompt ("You are GPT-6 Luna…") is part of the frozen prompt and does not follow the model id.
+
+## Project defaults
+
+A project can add rules to every packet it receives without touching the kit. Create `<repo>/.orchestration/project.json`; `templates/project.json` is an example. The wrapper looks for it from `--cwd` up to the git root, using the main checkout even for `--worktree` runs.
+
+- `constraints`, `required_checks`: appended to every Luna/Sol packet. Packets must use block lists (`key:` followed by `- item` lines); flow lists like `[]` are rejected so nothing gets silently dropped.
+- `context`: added to task packets as a `project_context:` block. Astra packets get it only with `"review_safe": true`, and never get the constraints or checks.
+- `roles.<role>.model` / `.effort`: override `config/models.json` for that project. `--effort` on the command line still wins.
+- Strictly append-only: sandbox, git rules, the blind-review allowlist and the frozen prompt text can't be changed. Invalid files stop the run (exit 2) and name the file.
+- Each run records `project_config` (file, sha256, what was applied), `model_source`/`effort_source`, and `prompt_sha256`, so runs with and without project defaults stay comparable.
+- Check what applies: `node ~/.claude/orchestration/scripts/codex-delegate.mjs config --explain <role> --cwd <repo> [--json]`.
 
 ## Quota gate
 
