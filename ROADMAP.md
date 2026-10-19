@@ -4,6 +4,8 @@ Basis: offline analysis of the 2026-10-19 telemetry packs (141 deduplicated prod
 
 Goal of this phase: measure when delegation pays off (first-pass acceptance, real rewrite effort, failure cause) and fix the operational weak points the telemetry exposed. Distribution comes later.
 
+Status (2026-10-20): steps 1–4 are implemented on branch `telemetry-fixes` and deployed on SERAPH. The step-5 routing rules are in `shared/ROUTING_POLICY.md` under "Evidence-based rules". Next: deploy on MSI (Windows + WSL), then collect runs.
+
 Ground rules for the whole phase:
 - Steps 1–4 run in order. Each step ships, deploys and passes its tests before the next starts.
 - No extra model calls for telemetry. Everything is collected mechanically or during Opus's existing `assess`.
