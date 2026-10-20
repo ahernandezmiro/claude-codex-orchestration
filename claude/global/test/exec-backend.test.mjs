@@ -251,7 +251,9 @@ test("runner loss is detected and reconciliation stops the surviving child", asy
   const running = stateOf(f.jobDir);
   assert.ok(running.child_pid);
   process.kill(running.runner_pid, "SIGKILL");
-  const lost = readJob(f.jobDir);
+  // Poll like the wrapper does: on POSIX the killed runner is a zombie (still signalable) until
+  // this process's event loop lets libuv reap it, so a synchronous readJob would still see it alive.
+  const lost = await waitJob(f.jobDir, { timeoutMs: 5000 });
   assert.equal(lost.state.status, "lost", JSON.stringify({ state: lost.state, running, alive: pidAlive(running.runner_pid) }));
   const failed = await reconcileLost(f.jobDir);
   assert.equal(failed.status, "failed");
