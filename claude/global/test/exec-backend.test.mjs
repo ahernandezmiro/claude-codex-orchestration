@@ -24,7 +24,8 @@ if (process.env.STUB_MODE === "version") { console.log("codex stub 1"); process.
 if (process.env.STUB_MODE === "fail-version") process.exit(1);
 if (process.env.STUB_MODE === "sleep" || process.env.STUB_MODE === "grandchild") {
   if (process.env.STUB_MODE === "grandchild") {
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    // Bounded lifetime: even if every cleanup path fails, the grandchild exits on its own.
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
     fs.writeFileSync(process.env.GRANDCHILD_PID_FILE, String(child.pid));
   }
   await new Promise((resolve) => setTimeout(resolve, 60000));
@@ -56,7 +57,6 @@ function pidAlive(pid) {
 
 function makeFixture(t, mode = "happy", extraEnv = {}) {
   const tmp = temp();
-  t.after(tmp.clean);
   const stub = path.join(tmp.dir, "stub-codex.mjs");
   const promptFile = path.join(tmp.dir, "prompt.txt");
   const jobDir = path.join(tmp.dir, "job");
@@ -64,7 +64,25 @@ function makeFixture(t, mode = "happy", extraEnv = {}) {
   fs.writeFileSync(promptFile, "prompt bytes\nline two\0tail");
   const env = { ...process.env, STUB_MODE: mode, ...extraEnv };
   const args = ["exec", "--json", "-s", "read-only", "-o", path.join(jobDir, "last-message.txt"), "-"];
-  return { tmp, stub, promptFile, jobDir, env, args };
+  // A test that ends early (failed assertion, timeout) must not leave its detached runner, stub
+  // and grandchild alive: on Windows they hold the test runner's output pipe open indefinitely.
+  const stopJob = async () => {
+    const statePath = path.join(jobDir, "state.json");
+    if (fs.existsSync(statePath) && ["pending", "running"].includes(stateOf(jobDir).status)) {
+      try { await cancelJob(jobDir, { graceMs: 50 }); } catch { /* fall through to direct kills */ }
+      for (const pid of [stateOf(jobDir).runner_pid, stateOf(jobDir).child_pid]) {
+        if (pid && pidAlive(pid)) try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    }
+    const grandchildFile = extraEnv.GRANDCHILD_PID_FILE;
+    if (grandchildFile && fs.existsSync(grandchildFile)) {
+      const pid = Number(fs.readFileSync(grandchildFile, "utf8"));
+      if (pid && pidAlive(pid)) try { process.kill(pid, "SIGKILL"); } catch {}
+      fs.rmSync(grandchildFile, { force: true });
+    }
+  };
+  t.after(async () => { await stopJob(); tmp.clean(); });
+  return { tmp, stub, promptFile, jobDir, env, args, stopJob };
 }
 
 async function start(f, overrides = {}) {
@@ -98,6 +116,20 @@ async function submitWithEnv(f, options) {
     }
   }
 }
+
+test("fixture cleanup stops a still-running job tree", async (t) => {
+  const grandchildPidFile = path.join(os.tmpdir(), `exec-grandchild-cleanup-${process.pid}-${Date.now()}`);
+  const f = makeFixture(t, "grandchild", { GRANDCHILD_PID_FILE: grandchildPidFile });
+  await start(f);
+  const deadline = Date.now() + 5000;
+  while (!(fs.existsSync(grandchildPidFile) && stateOf(f.jobDir).child_pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+  const running = stateOf(f.jobDir);
+  const grandchildPid = Number(fs.readFileSync(grandchildPidFile, "utf8"));
+  // What every fixture's t.after runs when its test ends early, for example on a failed assertion.
+  await f.stopJob();
+  for (const pid of [running.runner_pid, running.child_pid, grandchildPid]) assert.equal(pidAlive(pid), false, `pid ${pid} survived cleanup`);
+  assert.equal(fs.existsSync(grandchildPidFile), false);
+});
 
 test("buildExecArgs returns the documented vector and rejects unsafe sandboxes", () => {
   const common = { cwd: "/work/tree", model: "gpt-6-luna", effort: "low", lastMessageFile: "/job/last.txt" };

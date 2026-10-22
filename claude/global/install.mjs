@@ -69,11 +69,6 @@ function writeJson(file, value) {
   fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n");
 }
 
-function run(cmd, cmdArgs) {
-  const r = spawnSync(cmd, cmdArgs, { encoding: "utf8", shell: process.platform === "win32" });
-  return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
-}
-
 function preflight() {
   console.log("Preflight:");
   let ok = true;
@@ -101,8 +96,10 @@ function preflight() {
   const which = spawnSync(process.execPath, [wrapper, "which"], { encoding: "utf8" });
   const companionFound = which.status === 0 && !/companion: not found/.test(which.stdout || "");
   console.log(`  [info] companion ${companionFound ? "installed" : "not installed (only needed for --backend companion)"}`);
-  const mcp = run("codex", ["mcp-server", "--help"]);
-  console.log(`  [info] codex mcp-server ${/Usage: codex(.exe)? mcp-server/i.test(mcp.out) ? "available (codex-dispatch plugin usable)" : "not available (codex-dispatch plugin unusable)"}`);
+  // Same resolved binary as the login check, without a shell (a shell with args triggers DEP0190 on Node 24).
+  const mcp = codexBin.ok ? spawnSync(codexBin.command, [...codexBin.prefixArgs, "mcp-server", "--help"], { encoding: "utf8", shell: false }) : null;
+  const mcpOut = mcp ? `${mcp.stdout ?? ""}${mcp.stderr ?? ""}` : "";
+  console.log(`  [info] codex mcp-server ${/Usage: codex(.exe)? mcp-server/i.test(mcpOut) ? "available (codex-dispatch plugin usable)" : "not available (codex-dispatch plugin unusable)"}`);
   return ok;
 }
 
