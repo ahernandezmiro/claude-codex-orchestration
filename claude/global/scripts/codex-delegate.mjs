@@ -184,6 +184,93 @@ function findProjectConfig(startDir) {
 }
 
 /**
+ * Resolve the role-specific prompt from the nearest project override, kit override,
+ * or the role's kit default. Project discovery has the same boundary as project.json.
+ */
+function findRolePrompt(startDir, roleName) {
+  const role = ROLES[roleName];
+  if (!role) fail(`unknown role '${roleName}'`);
+  const ignored = [];
+  const warnings = [];
+  const knownFiles = new Set(Object.keys(ROLES).map((name) => `${name}.md`));
+  const start = path.resolve(startDir);
+  const rootValue = git(start, ["rev-parse", "--show-toplevel"]);
+  const root = rootValue ? path.resolve(rootValue) : start;
+  const dirs = [];
+  let dir = start;
+  while (true) {
+    dirs.push(dir);
+    if (dir === root || dir === path.dirname(dir)) break;
+    dir = path.dirname(dir);
+  }
+
+  const inspectRolesDir = (rolesDir) => {
+    if (!fs.existsSync(rolesDir)) return;
+    let entries;
+    try { entries = fs.readdirSync(rolesDir, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      const entryPath = path.join(rolesDir, entry.name);
+      if (entry.name.endsWith(".md") && !knownFiles.has(entry.name)) {
+        warnings.push(`ROLE PROMPT: ignoring unknown role file ${entryPath}`);
+      } else if (!entry.isFile()) {
+        warnings.push(`ROLE PROMPT: ignoring non-file role entry ${entryPath}`);
+      }
+    }
+  };
+  const readPrompt = (file, source) => {
+    let stat;
+    try { stat = fs.statSync(file); } catch { return null; }
+    if (!stat.isFile()) {
+      warnings.push(`ROLE PROMPT: ignoring non-file role entry ${file}`);
+      return null;
+    }
+    let text;
+    try { text = fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim(); }
+    catch (error) { fail(`cannot read role prompt ${file}: ${error.message}`); }
+    const byteLength = Buffer.byteLength(text, "utf8");
+    if (!text) fail(`role prompt is empty: ${file}`);
+    if (byteLength > 65536) fail(`role prompt exceeds 65536 bytes: ${file}`);
+    return { source, path: file, text, sha256: crypto.createHash("sha256").update(text, "utf8").digest("hex"), ignored, warnings };
+  };
+
+  for (const projectDir of dirs) {
+    const orchestrationDir = path.join(projectDir, ".orchestration");
+    const rolesDir = path.join(orchestrationDir, "roles");
+    inspectRolesDir(rolesDir);
+    const file = path.join(rolesDir, `${roleName}.md`);
+    if (!fs.existsSync(file)) continue;
+    if (!fs.statSync(file).isFile()) continue;
+    if (roleName.startsWith("astra-")) {
+      const reviewConfig = path.join(orchestrationDir, "project.json");
+      let reviewSafe = false;
+      if (fs.existsSync(reviewConfig)) {
+        try { reviewSafe = JSON.parse(fs.readFileSync(reviewConfig, "utf8")).review_safe === true; }
+        catch { /* findProjectConfig validates project.json separately when applicable */ }
+      }
+      if (!reviewSafe) {
+        ignored.push({ path: file, reason: "no review_safe: true next to it" });
+        warnings.push(`ROLE PROMPT: project override for ${roleName} ignored (no review_safe: true next to it)`);
+        continue;
+      }
+    }
+    const result = readPrompt(file, "project");
+    if (result) return result;
+  }
+
+  const globalDir = path.join(KIT_ROOT, "overrides", "roles");
+  inspectRolesDir(globalDir);
+  const globalFile = path.join(globalDir, `${roleName}.md`);
+  // inspectRolesDir already warned about a non-file entry here; do not warn twice.
+  const global = fs.existsSync(globalFile) && fs.statSync(globalFile).isFile() ? readPrompt(globalFile, "global") : null;
+  if (global) return global;
+  const defaultFile = path.join(KIT_ROOT, "codex", "prompts", "roles", role.defaultPrompt);
+  const fallback = readPrompt(defaultFile, "default");
+  if (!fallback) fail(`default role prompt not found: ${defaultFile}`);
+  return fallback;
+}
+
+/**
  * Add project constraints, checks and context to parsed packet blocks.
  * Input: splitTopLevel blocks, validated config, role name. Output: { blocks, applied }.
  */
@@ -591,6 +678,9 @@ async function cmdRun(options) {
   let cwd = path.resolve(options.cwd || process.cwd());
   if (!fs.existsSync(cwd)) fail(`--cwd does not exist: ${cwd}`);
   const project = findProjectConfig(cwd);
+  const rolePrompt = findRolePrompt(cwd, roleName);
+  for (const warning of rolePrompt.warnings) console.log(warning);
+  console.log(`ROLE PROMPT: ${rolePrompt.source} ${rolePrompt.path}`);
   const modelSelection = loadModelSelection().selection[roleName];
   const projectRole = project?.config.roles?.[roleName] || {};
   const model = projectRole.model || modelSelection.model;
@@ -636,7 +726,7 @@ async function cmdRun(options) {
   const stderrFile = `${base}.stderr.txt`;
   const baselineFile = `${base}.git-baseline.json`;
   const runFile = runJsonPath(base);
-  fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText, readKitFile(`codex/prompts/roles/${role.defaultPrompt}`)));
+  fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText, rolePrompt.text));
   const promptSha256 = crypto.createHash("sha256").update(fs.readFileSync(promptFile)).digest("hex");
 
   let worktree = null;
@@ -692,6 +782,7 @@ async function cmdRun(options) {
     packet_keys_sent: blocks.map((b) => b.key),
     blind_review_stripped_keys: strippedKeys,
     prompt_file: promptFile,
+    role_prompt: { source: rolePrompt.source, path: rolePrompt.path, sha256: rolePrompt.sha256 },
     stdout_file: stdoutFile,
     stderr_file: stderrFile,
     git_baseline_file: baselineFile,
@@ -1130,6 +1221,7 @@ function cmdConfigExplain(options, positionals) {
   const cwd = path.resolve(options.cwd || process.cwd());
   if (!fs.existsSync(cwd)) fail(`--cwd does not exist: ${cwd}`);
   const project = findProjectConfig(cwd);
+  const rolePrompt = findRolePrompt(cwd, roleName);
   const configured = loadModelSelection().selection[roleName];
   const projectRole = project?.config.roles?.[roleName] || {};
   const result = {
@@ -1143,7 +1235,8 @@ function cmdConfigExplain(options, positionals) {
     required_checks: roleName.startsWith("astra-") ? [] : (project?.config.required_checks || []),
     context: project && project.config.context && (!roleName.startsWith("astra-") || project.config.review_safe === true)
       ? project.config.context : null,
-    review_safe_applies: roleName.startsWith("astra-") ? project?.config.review_safe === true : null
+    review_safe_applies: roleName.startsWith("astra-") ? project?.config.review_safe === true : null,
+    role_prompt: { source: rolePrompt.source, path: rolePrompt.path, ignored: rolePrompt.ignored }
   };
   if (options.json) console.log(JSON.stringify(result, null, 2));
   else {
@@ -1155,6 +1248,9 @@ function cmdConfigExplain(options, positionals) {
     console.log(`required_checks: ${JSON.stringify(result.required_checks)}`);
     console.log(`context: ${result.context == null ? "none" : JSON.stringify(result.context)}`);
     if (result.review_safe_applies != null) console.log(`review_safe applies: ${result.review_safe_applies ? "yes" : "no"}`);
+    console.log(`ROLE PROMPT: ${rolePrompt.source} ${rolePrompt.path}`);
+    for (const warning of rolePrompt.warnings) console.log(warning);
+    if (rolePrompt.ignored.length) console.log(`role prompt ignored: ${JSON.stringify(rolePrompt.ignored)}`);
   }
   return 0;
 }
