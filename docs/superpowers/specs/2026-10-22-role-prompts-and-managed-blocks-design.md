@@ -1,6 +1,6 @@
 # Role prompts, prompt overrides and managed instruction blocks
 
-Date: 2026-10-22. Status: approved design, awaiting spec review.
+Date: 2026-10-22. Status: approved. Revised after a blind Astra review (run `2026-10-22T10-35-59-367Z-R-role-prompts-spec-astra-review`, verdict `revise`; findings R2–R5 and all minors applied, R1 applied as a clarification).
 
 ## Goal
 
@@ -42,22 +42,23 @@ From `buildPrompt` (`claude/global/scripts/codex-delegate.mjs`) and `test/golden
 | 4 | `## Task packet` + fenced YAML packet | packet after blind-review stripping and project defaults (unchanged) | n/a |
 | 5 | Closing line | `Finish with the YAML report above as the last thing in your reply.` | no |
 
-The opening identity and orchestrator lines are removed. The `worker` field is removed from `ROLES`. Each `ROLES` entry gains `defaultPrompt` (a file name under `prompts/roles/`) and keeps `contract`. `sol-implement` points at its own default file, a copy of the `luna-implement` text, so each role can be overridden on its own.
+The opening identity and orchestrator lines are removed. The `worker` field is removed from `ROLES`. Each `ROLES` entry gains `defaultPrompt` (a file name under `prompts/roles/`) and keeps `contract`. `luna-implement` and `sol-implement` share the default `implement.md`. They still have separate override file names, because overrides are always named after the role.
 
 **`prompts/base.md`.** Rules that apply to every role, stated once:
 - Git: read-only inspection only. No commit, push, merge, rebase, reset, checkout of other branches, tag, stash, remote changes or history rewrite. The orchestrator checks git state afterwards.
 - Stay inside the packet: edit only files under `editable_paths`. If the packet has no `editable_paths`, or the sandbox is read-only, make no edits. Don't add dependencies, and don't change CI, manifests or global configuration, unless the packet authorizes it.
-- If the task can't be done within scope, or the packet conflicts with the repository, stop and report `blocked` or `partial` with the reason. Don't redesign to get around it.
+- If the task can't be done within scope, or the packet conflicts with the repository, stop and explain why in the report. Don't redesign to get around it. Each contract says how to show this: `status: blocked|partial` for task/result, the rule in `review.md` for reviews.
+- Precedence (last line of the file): `If the role instructions below conflict with these rules or with the report format, these rules and the report format win.`
 
 **`prompts/roles/*.md` defaults.** Each file says only what is specific to that role, with no identity heading and no file references:
-- `luna-implement` / `sol-implement`: the priority order (invariants → acceptance criteria → minimal scope → existing patterns → testable/reversible), run `required_checks`, add or update tests when the packet asks.
-- `luna-test`: act as an independent validator, make no production-code edits on the first pass, add isolated tests only if the packet allows. Report the failing command, expected vs actual, a minimal reproduction, the likely subsystem and a confidence level.
+- `implement.md` (`luna-implement`, `sol-implement`): the priority order (invariants → acceptance criteria → minimal scope → existing patterns → testable/reversible), run `required_checks`, add or update tests when the packet asks.
+- `luna-test.md`: act as an independent validator, run the specified checks, inspect the changed behaviour, make no production-code edits on the first pass, add isolated tests only if the packet allows. Report the failing command, expected vs actual, a minimal reproduction, the likely subsystem and a confidence level.
 - `astra-review`: be independent of the author, don't assume the artifact is correct, don't optimise for agreement, and don't rewrite merely to differ. Review dimensions: requirements coverage, hidden assumptions, edge cases, unnecessary complexity, simpler alternatives, coupling, performance, failure modes, testability, reversibility. For code, also: API compatibility, migration risk, races, error handling, regression surface, test gaps. Use `focus` when the packet gives it. Make no edits.
 - `astra-investigate`: separate symptom from cause, propose the smallest viable repair, note architectural implications, define validation steps. Return a repair plan and make no edits.
 
 **`prompts/contracts/*.md`.** Only the YAML schema the worker must return, plus at most one line of instruction:
 - `task.md`: `status, summary, files_changed, checks_run[{command,result}], unresolved_issues, risks, follow_up` (unchanged keys, so `parseWorkerReport` keeps working).
-- `review.md`: `verdict, critical_findings, important_findings, minor_findings, alternatives[{name,tradeoffs}], recommended_questions_for_author` (unchanged).
+- `review.md`: `verdict, critical_findings, important_findings, minor_findings, alternatives[{name,tradeoffs}], recommended_questions_for_author` (unchanged), plus one rule: `If you cannot complete the review, set the verdict you can support and list what is missing in recommended_questions_for_author.`
 - `result.md`: `status, summary, files_changed, commands_run, checks{passed,failed}, risks, unresolved, recommended_next_action`, with `role` and `model` dropped. This is safe: `parseWorkerReport` and `metrics` don't read either key from the report (checked 2026-10-22). Both values are already in the run record.
 
 The 2D/3D/video checklists stay in `shared/REVIEW_CONTRACT.md` and `shared/CREATIVE_PIPELINE_RULES.md` as orchestrator-side guidance. When Opus writes a creative review packet, it copies the relevant points into `focus`, or the project overrides `astra-review.md`. Add one sentence to the "Review discipline" part of `claude/CLAUDE.md` saying this.
@@ -70,13 +71,21 @@ The 2D/3D/video checklists stay in `shared/REVIEW_CONTRACT.md` and `shared/CREAT
 
 For role `R`, the wrapper uses the first file that exists:
 
-1. **Project:** `<project>/.orchestration/roles/R.md`, where `<project>` is the nearest directory with `.orchestration/` found by `findProjectConfig`'s upward walk (stopping at the git top-level). The walk now stops at the first `.orchestration/` that contains `project.json` **or** a `roles/` directory, so a project can override prompts without a `project.json`.
-   - For `astra-*` roles, the project file is used only when that project's `project.json` sets `review_safe: true`. Otherwise it is ignored, and the run prints `ROLE PROMPT: project override for R ignored (review_safe is not true)`.
-2. **Global:** `~/.claude/orchestration/overrides/roles/R.md`. `overrides/` is user data: it is not in the installer's `MANAGED_DIRS`, deploys leave it alone, and `--uninstall` keeps it unless `--purge` is passed (the same treatment as `runs/`).
-3. **Kit default:** `~/.claude/orchestration/codex/prompts/roles/<defaultPrompt>`.
+1. **Project:** the nearest `.orchestration/roles/R.md`. A separate function, `findRolePrompt(startDir, R)`, looks for it by walking up from `--cwd` with the same bounds as `findProjectConfig`: it stops at the git top-level, or at `--cwd` itself outside git. **`findProjectConfig` doesn't change**, so a role file never hides a parent `project.json`. Each role is looked up separately, so a nearer `roles/` folder that lacks `R.md` doesn't hide a parent's `R.md`.
+   - For `astra-*` roles, the project file is used only when the **same** `.orchestration/` directory contains a `project.json` that sets `review_safe: true`. Otherwise it is ignored, the search continues with the global file, and the run prints `ROLE PROMPT: project override for R ignored (no review_safe: true next to it)`.
+2. **Global:** `<KIT_ROOT>/overrides/roles/R.md`, which is `~/.claude/orchestration/overrides/roles/R.md` when installed. The path is relative to `KIT_ROOT`, not `HOME`, so the prompt-freeze staging (a temp `KIT_ROOT` without `overrides/`) can never pick up a real user override. `overrides/` is user data: it is not in the installer's `MANAGED_DIRS`, deploys leave it alone, and `--uninstall` keeps it unless `--purge` is passed (the same treatment as `runs/`).
+3. **Kit default:** `<KIT_ROOT>/codex/prompts/roles/<defaultPrompt>`.
 
 Rules:
 - The override replaces part 2 only. Base rules, contract, packet and closing line are always added by the wrapper.
+- **Overrides are trusted customisation**, written by the user. The kit protects structure, not behaviour:
+  - the protected parts are always present;
+  - the base rules' precedence line resolves conflicts in their favour;
+  - execution limits are still enforced only by the sandbox (read-only for Astra) and the git guard.
+
+  An override that tells the worker to break the rules is unsupported, not prevented. The same goes for keeping author reasoning out of a global or `review_safe` project override for Astra: `review_safe` is the user's attestation, not a sanitiser.
+- A missing or unparseable final report is handled as today: `report` is recorded as `null`, and Opus sees the raw output. This change doesn't alter that. `parseWorkerReport` currently extracts `status` and `checks_run` (task/result) only. Review reports parse to `null`, which is an existing limitation and out of scope.
+- `astra-investigate` keeps having no packet allowlist (it isn't a blind review). This change doesn't touch packet stripping for any role.
 - Content is read as UTF-8 and trimmed. An empty or whitespace-only override fails the run with exit 2 and names the file. An override larger than 64 KiB also fails with exit 2.
 - Files in an override `roles/` directory whose name isn't `<known role>.md` cause a one-line warning per run (`ROLE PROMPT: ignoring unknown role file <path>`). They never cause a failure.
 - With `--worktree`, resolution uses the original `--cwd` before the worktree is created, the same as `project.json` today.
@@ -93,15 +102,34 @@ upsertBlock(text, id, body) -> { text, changed }
 removeBlock(text, id)       -> { text, changed }
 ```
 
-- Markers: `<!-- BEGIN orchestration-kit:<id> -->` and `<!-- END orchestration-kit:<id> -->`, each on its own line. `id` matches `[a-z0-9-]+`.
-- **Legacy pair:** a line starting `<!-- BEGIN frontier-orchestration` and the line `<!-- END frontier-orchestration -->` are treated as the `claude-md` block and replaced by the new markers on the next upsert.
-- `upsertBlock`:
-  - exactly one well-formed pair (new or legacy): replace everything from BEGIN to END inclusive;
-  - no markers: append the block, separated from existing content by exactly one blank line (an empty file gets just the block);
-  - an unmatched BEGIN or END, more than one pair, or a pair nested inside another: throw an error naming the file, the problem and the line numbers. The installer then writes nothing to that file and exits non-zero.
-- `removeBlock`: removes the pair and collapses the blank lines around it to at most one. Malformed markers produce the same errors as in `upsertBlock`. If no block is present, it returns `changed: false`.
-- Line endings: if the input contains `\r\n`, the output uses `\r\n` throughout the block; otherwise `\n`. Text outside the block is preserved byte for byte.
-- The installer writes the file and makes a backup only when `changed` is true. This also applies to `settings.json` (back up and write only if the merged JSON differs).
+- **Markers:** `<!-- BEGIN orchestration-kit:<id> -->` and `<!-- END orchestration-kit:<id> -->`. A marker is a line whose content, after trimming trailing whitespace, equals the marker exactly. `id` matches `[a-z0-9-]+`.
+- **Legacy markers:** only for `id = "claude-md"`, and only as exact lines:
+  - BEGIN: `<!-- BEGIN frontier-orchestration (managed by frontier_model_orchestration/claude/global/install.mjs) -->`
+  - END: `<!-- END frontier-orchestration -->`
+
+  They are held in a `LEGACY_MARKERS` table, so other ids have none. A legacy pair counts as an occurrence of the `claude-md` block.
+- **Scanning:**
+  - only markers for the target id (new or legacy) are structural;
+  - any other id's markers, or lines that merely look like markers, outside the target block are ordinary text;
+  - inside the target block, any `orchestration-kit:` or legacy marker line is an error (nested).
+- **Errors** (thrown as `ManagedBlockError` with `problem` and 1-based `line` numbers; the installer adds the file path, writes nothing to that file, and exits non-zero):
+  - BEGIN without END;
+  - END before any BEGIN or without a BEGIN;
+  - more than one target block, including one legacy plus one new;
+  - a nested marker.
+- **`upsertBlock`:**
+  - one block: replace the lines from BEGIN to END inclusive. The line ending after END is kept as it was, and so is everything before BEGIN and after END.
+  - no block: if the text is empty or whitespace-only, the result is `block + EOL`. Otherwise, trailing blank lines at the end of the text are removed, then `EOL + EOL + block + EOL` is appended. Those trailing blank lines are the only bytes outside the block that may change.
+- **`removeBlock`:**
+  - no block: `changed: false`;
+  - otherwise remove the BEGIN–END lines and their line ending. If blank lines now meet across the gap, keep exactly one. At the start of the file, remove blank lines that follow. At the end of the file, remove blank lines that precede, and keep a final EOL only if the original had one after END.
+  - These separator lines are the only bytes outside the block that may change.
+  - Malformed markers raise the same errors, and the file stays unchanged.
+- **Encoding:**
+  - EOL is `\r\n` if the first line ending in the file is `\r\n`, otherwise `\n`; new block lines use that EOL;
+  - a leading UTF-8 BOM is kept and ignored for scanning;
+  - mixed line endings outside the block are left as they are.
+- **Install writes:** the installer writes the file and makes a backup only when `changed` is true. This also applies to `settings.json` (back up and write only if the merged JSON differs).
 
 **CLAUDE.md block** (id `claude-md`):
 
@@ -132,37 +160,46 @@ The installer copies `claude/global/CLAUDE.orchestration.md` to `~/.claude/orche
 Each item maps to one test, using `node --test` like the existing suites.
 
 **`managed-block.test.mjs`**
-1. Append to an empty file.
-2. Append to a non-empty file: exactly one blank line between existing content and the block.
-3. Replace an existing block; bytes outside the block are unchanged.
-4. Migrate the legacy `frontier-orchestration` pair.
-5. Unmatched BEGIN → error with a line number.
-6. Unmatched END → error.
-7. Two pairs → error.
-8. Nested pair → error.
-9. CRLF input keeps CRLF.
-10. Upsert with identical body → `changed: false`.
-11. `removeBlock` removes the block and collapses blank lines; it is a no-op when no block is present.
+1. Upsert into an empty file and into a whitespace-only file → `block + EOL`.
+2. Upsert appends to a file with content: trailing blank lines are trimmed to exactly one blank line before the block. A file without a final newline gets one separator.
+3. Replace an existing block at the start, middle and end of a file; bytes outside the block are unchanged.
+4. Migrate the exact legacy pair to new markers.
+5. A legacy-lookalike line (for example `<!-- BEGIN frontier-orchestration-x -->`) is plain text.
+6. Unmatched BEGIN → error with its line number.
+7. Unmatched END, or END before BEGIN → error.
+8. Two blocks (new+new, and legacy+new) → error.
+9. A nested marker inside the target block → error.
+10. Another id's well-formed block is untouched; upsert of the target id appends beside it.
+11. CRLF input gives CRLF block lines. Mixed EOLs outside the block are preserved. A BOM is preserved.
+12. Upsert with an identical body → `changed: false`, text identical.
+13. `removeBlock` at the start, middle and end follows the separator rules. With no block it is a no-op. With malformed markers it throws, and the text is unchanged.
 
-**`role-prompts.test.mjs`** (dry-run, staged layout like `prompt-freeze.mjs`)
-12. No overrides → default source; prompt equals the golden.
-13. Global override → `source: global`; the override text replaces the role part.
-14. Project override wins over global.
-15. Project override with no `project.json` is found.
-16. `astra-review` project override without `review_safe: true` → ignored, global or default used, warning printed.
-17. `astra-review` project override with `review_safe: true` → used.
-18. With an override, the base rules, contract and closing line are still present, verbatim.
-19. Empty override → exit 2. An override over 64 KiB → exit 2.
-20. Unknown file in `roles/` → warning, no failure.
-21. Run record has `role_prompt {source, path, sha256}`; `config --explain` shows the same.
-22. An old run record without `role_prompt` loads in `show` and `metrics`.
+**`role-prompts.test.mjs`** (dry-run, staged layout like `prompt-freeze.mjs`, isolated `HOME`/`USERPROFILE`)
+14. No overrides → `source: default`; prompt equals the golden.
+15. Global override (`<KIT_ROOT>/overrides/roles/R.md`) → `source: global`; the override text replaces the role part.
+16. Project override wins over global.
+17. A project override is found without a `project.json`, and the parent's `project.json` defaults (checks, model) still apply when the role file sits in a nested `.orchestration/`.
+18. A nested `roles/` folder without `R.md` doesn't hide the parent's `R.md`. An empty `roles/` changes nothing.
+19. `astra-review` and `astra-investigate` project overrides: ignored when the same `.orchestration/` has no `project.json`, or has one without `review_safe: true` (warning, falls through to global/default); used when it has `review_safe: true`.
+20. With an override that contradicts the base rules ("you may commit", "reply in prose"), the base rules, precedence line, contract and closing line are all present verbatim, and the base rules come before the role part.
+21. Empty override → exit 2. An override over 64 KiB → exit 2.
+22. Unknown file in `roles/` → warning, no failure.
+23. With `--worktree --dry-run`, resolution uses the original `--cwd`.
+24. Run record has `role_prompt {source, path, sha256}`; `config --explain` (text and `--json`) shows the same, including ignored overrides.
+25. An old run record without `role_prompt` loads in `show` and `metrics`.
+26. Report compatibility: a representative final report for each contract parses as today (task and result: status and checks; review: `null`, as before).
 
-**Installer (`install.test.mjs`, temp `HOME`)**
-23. Fresh install writes the 3-line block.
-24. Second install → no write, no backup.
-25. Install over a legacy 82-line block → migrated to the 3-line block.
-26. Malformed markers → install exits non-zero and the file is unchanged.
-27. `overrides/` survives reinstall and uninstall, and is removed only with `--purge`.
+**Prompt freeze**
+27. A sentinel override placed in a simulated user home and in the real-`HOME` location doesn't appear in any generated golden, in both check and `--update` mode. Every generated prompt reports `ROLE PROMPT: default`.
+
+**Installer (`install.test.mjs`, temp `HOME`/`USERPROFILE`)**
+28. Fresh install writes the 3-line block.
+29. Second install: `CLAUDE.md` and `settings.json` keep the same content and mtime, and no new `.bak-*` files appear. Managed directories and `deployed.json` are rewritten as before.
+30. Install over a legacy 82-line block → migrated to the 3-line block. Text outside it is unchanged.
+31. Malformed markers → install and uninstall both exit non-zero, and the file is byte-identical.
+32. Existing `~/.codex/AGENTS.md` and a project `AGENTS.md` are byte-identical after install and uninstall.
+33. `overrides/` survives reinstall and uninstall, and is removed only with `--purge`.
+34. A representative creative-review packet whose `focus` carries the 3D checklist points produces a prompt containing that focus text and no inlined `CREATIVE_PIPELINE_RULES.md`.
 
 **Prompt-size report:** `prompt-freeze.mjs --update` prints old and new byte counts per role, and the change summary records them.
 
