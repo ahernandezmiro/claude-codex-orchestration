@@ -84,4 +84,11 @@ Done when: a project file adds a required check that shows up in the prompt and 
   - game-engine packets need a runtime smoke test;
   - DSP or other algorithm-heavy work starts with a feasibility spike.
 - Effort stays at `high` for this batch so it doesn't confound the other changes. A `medium` experiment comes later, on its own.
+- **Prompt version 2 (2026-10-22).** Worker prompts were rebuilt from deduplicated fragments under `codex/prompts/`, and role prompts became overridable (`docs/superpowers/specs/2026-10-22-role-prompts-and-managed-blocks-design.md`). Golden sha256 prefixes:
+  - luna-implement / sol-implement `5dc18a858bc5`
+  - luna-test `7ba03d5a8096`
+  - astra-review `01e6da372a67`
+  - astra-investigate `54df5ccaeb8a`
+
+  Analyse the runs before and after this change separately, using `prompt_sha256`, and exclude runs whose `role_prompt.source` isn't `default`. Deploy on every machine in the same sitting.
 - Target: about 50 new production runs on both machines. Then repack, re-analyse with `metrics`, and decide on plugin packaging and the config waterfall from the evidence.

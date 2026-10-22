@@ -10,7 +10,7 @@ This file adds to `BOOTSTRAP.md`; it doesn't replace it. `BOOTSTRAP.md` says *wh
 
 ```
 you ──► Claude Code (Opus, orchestrator)
-          │  reads ~/.claude/CLAUDE.md  (managed block → imports routing policy + identity)
+          │  reads ~/.claude/CLAUDE.md  (3-line managed block → @imports CLAUDE.orchestration.md → routing policy + identity)
           │  writes task / review packets  (<project>/.orchestration/tasks/*.yaml)
           ▼
         subagent luna-worker / astra-reviewer   (~/.claude/agents, haiku, Bash only, no conversation context)
@@ -30,11 +30,11 @@ you ──► Claude Code (Opus, orchestrator)
 
 | Role | Model | Codex sandbox | Contract returned |
 |---|---|---|---|
-| `luna-implement` | `gpt-6-luna` | workspace-write | TASK_CONTRACT completion report |
-| `luna-test` | `gpt-6-luna` | workspace-write | TASK_CONTRACT completion report |
-| `sol-implement` | `gpt-6-sol` | workspace-write | TASK_CONTRACT completion report |
-| `astra-review` | `gpt-6-astra` | read-only | REVIEW_CONTRACT yaml (verdict/findings/alternatives) |
-| `astra-investigate` | `gpt-6-astra` | read-only | codex/RESULT_CONTRACT yaml |
+| `luna-implement` | `gpt-6-luna` | workspace-write | `codex/prompts/contracts/task.md` |
+| `luna-test` | `gpt-6-luna` | workspace-write | `codex/prompts/contracts/task.md` |
+| `sol-implement` | `gpt-6-sol` | workspace-write | `codex/prompts/contracts/task.md` |
+| `astra-review` | `gpt-6-astra` | read-only | `codex/prompts/contracts/review.md` (verdict/findings/alternatives) |
+| `astra-investigate` | `gpt-6-astra` | read-only | `codex/prompts/contracts/result.md` |
 
 All roles use reasoning effort `high` (the companion accepts at most `xhigh`; override per run with `--effort`).
 
@@ -99,14 +99,15 @@ Source files in the kit (`claude/global/`), with where the installer copies them
 | `agents/luna-worker.md` | `~/.claude/agents/` | forwards a task packet to `luna-implement` / `luna-test` / `sol-implement` |
 | `agents/astra-reviewer.md` | `~/.claude/agents/` | forwards a review packet to `astra-review` / `astra-investigate` |
 | `templates/task-packet.yaml`, `review-packet.yaml` | `~/.claude/orchestration/templates/` | packet starting points |
-| `CLAUDE.orchestration.md` | managed block in `~/.claude/CLAUDE.md` | routing rules, role table, workflow, blind-review and git rules |
+| `CLAUDE.orchestration.md` | `~/.claude/orchestration/claude/`, imported by the `orchestration-kit:claude-md` block in `~/.claude/CLAUDE.md` | routing rules, role table, workflow, blind-review and git rules |
+| `scripts/managed-block.mjs` | `~/.claude/orchestration/scripts/` | id-scoped marker blocks; refuses unmatched, duplicate or nested markers |
 | `settings.permissions.json` | merged into `~/.claude/settings.json` | allow the wrapper; *ask* before `git push/merge/rebase/reset --hard/remote/filter-*` and `commit --amend` |
-| `../../shared`, `../../codex`, `../*.md` | `~/.claude/orchestration/{shared,codex,claude}/` | the policy docs the wrapper inlines into prompts and that CLAUDE.md imports |
+| `../../shared`, `../../codex`, `../*.md` | `~/.claude/orchestration/{shared,codex,claude}/` | `codex/prompts/` is what the wrapper assembles into worker prompts; the rest is policy that CLAUDE.md imports |
 
 Design decisions:
 - **Blindness is enforced by structure, not convention.** The subagents start with no conversation context, and the wrapper sends only allowlisted packet keys (`id, role, requirements, constraints, context, artifact, focus, out_of_scope`) for `astra-review`, printing `BLIND REVIEW: stripped …` for anything else.
 - **Git safety has two layers.** The prompt forbids every git mutation, and a before/after snapshot of HEAD, branch, all refs, remotes and stash produces a hard `GIT GUARD: VIOLATION` (exit 3). For background runs, the baseline is saved and checked later by `collect` (or by `verify-git`).
-- **Prompts are self-contained.** The role doc and contract text are inlined, so the target repo needs no kit files. Prompts and baselines are kept under `~/.claude/orchestration/runs/` for auditing.
+- **Prompts are self-contained.** Base rules, role prompt and contract are inlined, so the target repo needs no kit files. Only the role prompt can be overridden (README "Role prompt overrides"). Prompts and baselines are kept under `~/.claude/orchestration/runs/` for auditing.
 
 ### Step 4: Install globally
 

@@ -60,15 +60,4 @@ Reviewer should NOT receive the producing model's hidden reasoning or persuasive
 
 ## Output format
 
-```yaml
-verdict: acceptable | revise | rethink
-critical_findings: []
-important_findings: []
-minor_findings: []
-alternatives:
-  - name: ...
-    tradeoffs: ...
-recommended_questions_for_author: []
-```
-
-The reviewer does not make edits during the first review pass unless specifically asked.
+The reviewer's output schema is defined once, in `codex/prompts/contracts/review.md`, and the wrapper adds it to every Astra review prompt. The 2D/3D/video checklists above aren't sent to the reviewer: copy the relevant points into the packet's `focus`.

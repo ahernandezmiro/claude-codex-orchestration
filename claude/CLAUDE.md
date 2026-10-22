@@ -44,6 +44,7 @@ For independent review:
 - do not pass your hidden reasoning transcript
 - request explicit alternatives and tradeoffs
 - assess Astra's findings yourself; do not automatically accept them
+- for 2D/3D/video reviews, copy the relevant checklist points from `../shared/REVIEW_CONTRACT.md` into the packet's `focus`; the reviewer prompt doesn't include them
 
 ## Worker discipline
 

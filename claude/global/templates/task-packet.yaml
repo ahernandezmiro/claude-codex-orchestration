@@ -22,9 +22,3 @@ required_checks:
 
 out_of_scope:
   - explicitly excluded work
-
-output:
-  summary: true
-  files_changed: true
-  tests_run: true
-  unresolved_issues: true

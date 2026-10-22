@@ -1,11 +1,11 @@
 {
-  "claude/CLAUDE.md": "dc0daef0de4dc158aee5633470b5109bdb62edb84a4dd7d2884ae407c5a44456",
+  "claude/CLAUDE.md": "eeab21786bbc85ee250dd555480c0481585422beb430f93dbd5237d30fe6c2bf",
   "claude/ROLE_ASTRA_REVIEW.md": "f20e21e3ea24796bb54c14bbb69032c86b00b9482728bd372e7fd2f98793d24b",
   "claude/ROLE_LUNA_DISPATCH.md": "c88191b52f019aab93b5b04ee0f2fefc78cdb68bbbdb87878e04661c6d7fcef3",
   "claude/ROLE_OPUS_SYNTHESIS.md": "966a7672bccbd098f7d4911fa8ca9660f67a2dd402ff8da62aca8a196f43819d",
   "claude/global/CLAUDE.orchestration.md": "e6d6c9188d7dda30ca6d7a6307a0173ba3fead11029ab630bd0530a6b955e599",
-  "claude/global/agents/astra-reviewer.md": "06391907e8d6c25dad351140f5521388e4bddc064fadce087422c33e2123516f",
-  "claude/global/agents/luna-worker.md": "db9b101b648abf032461580ff65fb9f283c4e19a209b895de53d64ae1395fc81",
+  "claude/global/agents/astra-reviewer.md": "5c778825622857c7dd9de0b4d9ae19c519cb55bb911841fd633760bf14c34f32",
+  "claude/global/agents/luna-worker.md": "1d62d3484ceb695f34a67a8f65fccedfa3ce8f2211570a764713dca66178baa3",
   "codex/BOOTSTRAP.md": "ba164f0a06778f7c2d29a891b55b11818a6d9111c91de4ba62a104424fcff5cf",
   "codex/CONFIG_TEMPLATE.md": "c22eaa60920d78d9474111fc23dfcbe772eca188702aefcab8590d917fd818bd",
   "codex/prompts/base.md": "83af15c35de79a6d1c73fbac51a382099005276f343eb14f9326d49fa76bea6e",
@@ -17,7 +17,7 @@
   "codex/prompts/roles/implement.md": "9003f0859cb16e8f9fef60781e61cc72568fad5c38c370211a88a8a1f7b4ab96",
   "codex/prompts/roles/luna-test.md": "ff95fc8dc3ac8f26e0ee965bd0708ef2a4aa0ab4d1ef0bd374845abfb56df65b",
   "shared/CREATIVE_PIPELINE_RULES.md": "b9ed31c8e8888e9c0b7075e0a01c64d32c97472bda6a9d8cbf685c39c15996c8",
-  "shared/REVIEW_CONTRACT.md": "d2d3a34c213bafbb32a768eb9e04bd25b23c58dff6d7cced21b08aec160589ff",
+  "shared/REVIEW_CONTRACT.md": "14370f164619cf42937ea60a1f273f2aecd17bfce0fc4a6b08a1cb0ab95cf353",
   "shared/ROUTING_POLICY.md": "a26426a32300c81a906f9a326e29ba32b83dea2940908ab6f52e8bb212af6c4a",
-  "shared/TASK_CONTRACT.md": "016d40c30bbd5b524a4b90b2e9db0250004c48420df5167c4e5ac28478e51a1d"
+  "shared/TASK_CONTRACT.md": "d07d8f581d2e2482d3f7799cdc9c7c7b78a4966bbb2cde3e55d9b52958bc13e2"
 }

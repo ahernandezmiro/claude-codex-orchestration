@@ -23,7 +23,9 @@ The kit itself is documented in [claude/GLOBAL_INSTALL.md](claude/GLOBAL_INSTALL
 | `claude/global/templates/project.json` | example per-project defaults (`<repo>/.orchestration/project.json`) | `~/.claude/orchestration/templates/` |
 | `claude/global/config/models.local.json` | optional per-machine override (gitignored) | same, if present |
 | `claude/global/agents/*.md` | `luna-worker`, `astra-reviewer` subagents | `~/.claude/agents/` |
-| `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | managed block in `~/.claude/CLAUDE.md` |
+| `codex/prompts/` | worker prompt fragments: `base.md`, `roles/*.md` (overridable defaults), `contracts/*.md` | `~/.claude/orchestration/codex/prompts/` |
+| `claude/global/CLAUDE.orchestration.md` | orchestrator instructions | `~/.claude/orchestration/claude/`, imported by a 3-line managed block in `~/.claude/CLAUDE.md` |
+| `claude/global/scripts/managed-block.mjs` | id-scoped `<!-- BEGIN/END orchestration-kit:<id> -->` blocks; the installer refuses malformed markers and writes only on change | `~/.claude/orchestration/scripts/` |
 | `claude/global/settings.permissions.json` | allow/ask rules | merged into `~/.claude/settings.json` |
 | `claude/global/install.mjs` | cross-platform installer | — |
 | `claude/global/test/` | validation packets, playground creator, prompt-freeze guard + golden prompts, quota-gate and packer tests | — |
@@ -57,12 +59,12 @@ What a deploy does:
    - preflight checks;
    - deletes and re-copies the kit-managed folders (`shared, codex, claude, scripts, templates, config`), so removed files disappear too;
    - installs the agents;
-   - replaces the managed `CLAUDE.md` block;
-   - merges the permission rules (`CLAUDE.md` and `settings.json` are backed up first);
+   - adds or replaces the `orchestration-kit:claude-md` block in `CLAUDE.md` (one `@` import line; an old inlined `frontier-orchestration` block is migrated, and malformed markers stop the install before anything changes);
+   - merges the permission rules (`CLAUDE.md` and `settings.json` are written, and backed up first, only when they change). No `AGENTS.md` is ever written;
    - writes `~/.claude/orchestration/deployed.json` (commit, dirty flag, host, effective models).
 4. Prints the effective model selection.
 
-`runs/` and `telemetry/` are never touched. Other options: `-DryRun`/`--dry-run`, `-Uninstall [-Purge]`/`--uninstall [--purge]`, `-AllowPromptChange`/`--allow-prompt-change`.
+`runs/`, `telemetry/` and `overrides/` are never touched. Other options: `-DryRun`/`--dry-run`, `-Uninstall [-Purge]`/`--uninstall [--purge]`, `-AllowPromptChange`/`--allow-prompt-change`.
 
 ## Model configuration
 
@@ -91,6 +93,16 @@ A project can add rules to every packet it receives without touching the kit. Cr
 - Strictly append-only: sandbox, git rules, the blind-review allowlist and the frozen prompt text can't be changed. Invalid files stop the run (exit 2) and name the file.
 - Each run records `project_config` (file, sha256, what was applied), `model_source`/`effort_source`, and `prompt_sha256`, so runs with and without project defaults stay comparable.
 - Check what applies: `node ~/.claude/orchestration/scripts/codex-delegate.mjs config --explain <role> --cwd <repo> [--json]`.
+
+## Role prompt overrides
+
+A worker prompt has five parts: base rules (`codex/prompts/base.md`), the role prompt, the report contract (`codex/prompts/contracts/`), the packet, and a closing line. Only the role prompt can be replaced. The wrapper uses the first of these files that exists:
+
+1. `<repo>/.orchestration/roles/<role>.md`: the nearest one from `--cwd` up to the git root, looked up separately for each role. It doesn't need a `project.json`. For `astra-review` / `astra-investigate`, it is used only if the same `.orchestration/` folder has a `project.json` with `"review_safe": true`.
+2. `~/.claude/orchestration/overrides/roles/<role>.md`: global for this machine. Deploys never touch it, and `--uninstall` keeps it unless you pass `--purge`.
+3. The kit default in `codex/prompts/roles/`.
+
+An override replaces the whole role prompt, with no merging. It must be non-empty and at most 64 KiB, otherwise the run stops with exit 2. Overrides are trusted text: base rules and the report format take precedence over them, but only the sandbox and the git guard actually enforce anything. Each run prints `ROLE PROMPT: <default|global|project> <path>` and records `role_prompt` (source, path, sha256), so runs with overrides can be analysed separately. `config --explain` shows which file applies and any overrides it ignored.
 
 ## Quota gate
 

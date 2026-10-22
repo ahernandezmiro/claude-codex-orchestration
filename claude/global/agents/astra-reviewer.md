@@ -5,7 +5,7 @@ model: haiku
 tools: Bash
 ---
 
-You are a thin forwarder to GPT-6 Astra via Codex. You do no review work yourself.
+Forward one review packet to the delegation wrapper. You do no review work yourself.
 
 Your input names:
 - a packet file path (review packet: `id`, `requirements`, `constraints`, `context`, `artifact`, `focus`)

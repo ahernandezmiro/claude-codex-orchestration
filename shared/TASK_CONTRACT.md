@@ -31,36 +31,8 @@ required_checks:
 
 out_of_scope:
   - explicitly excluded work
-
-output:
-  summary: true
-  files_changed: true
-  tests_run: true
-  unresolved_issues: true
 ```
 
-## Rules
+## Worker rules and report
 
-- Delegated workers must not silently expand scope.
-- If a task requires architectural changes outside the packet, stop and report the need for redesign.
-- If a requested file is outside `editable_paths`, do not modify it without explicit approval.
-- Do not commit, push, merge, rewrite history, or alter remote branches unless the task explicitly authorizes it.
-- Do not modify CI, dependency manifests, engine-wide configuration, or global settings unless explicitly authorized.
-- Prefer existing abstractions and dependencies over adding new ones.
-- New dependencies require justification.
-
-## Completion report
-
-Every worker returns:
-
-```yaml
-status: completed | partial | blocked
-summary: ...
-files_changed: []
-checks_run:
-  - command: ...
-    result: pass | fail | not-run
-unresolved_issues: []
-risks: []
-follow_up: []
-```
+The worker-side rules and the completion report schema are defined once, in `codex/prompts/base.md` and `codex/prompts/contracts/task.md`. The wrapper adds both to every Luna/Sol prompt, so packets don't repeat them.
