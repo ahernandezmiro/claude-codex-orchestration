@@ -168,7 +168,8 @@ test("submitJob and waitJob preserve prompt bytes, args, events, final message a
   const f = makeFixture(t, "happy", { INPUT_FILE: inputFile });
   try {
     const submitted = await start(f);
-    assert.equal(submitted.state.status, "running");
+    // A fast stub can finish before submitJob's first acknowledgement poll; both mean the runner started.
+    assert.ok(["running", "completed"].includes(submitted.state.status), submitted.state.status);
     const result = await waitJob(f.jobDir, { timeoutMs: 10000 });
     assert.equal(result.state.status, "completed");
     assert.equal(fs.readFileSync(inputFile, "utf8"), fs.readFileSync(f.promptFile, "utf8"));
