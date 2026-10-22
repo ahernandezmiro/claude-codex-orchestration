@@ -4,12 +4,12 @@
 //   node claude/global/install.mjs --check       preflight only, changes nothing
 //   node claude/global/install.mjs --dry-run     show what would change
 //   node claude/global/install.mjs               install / update
-//   node claude/global/install.mjs --uninstall   remove everything this installer added, except run/telemetry data
-//   node claude/global/install.mjs --uninstall --purge   also delete runs/ and telemetry/
+//   node claude/global/install.mjs --uninstall   remove installed files, preserving runs/, telemetry/ and overrides/
+//   node claude/global/install.mjs --uninstall --purge   also delete runs/, telemetry/ and overrides/
 //
 // Install and update are the same operation: the managed folders under ~/.claude/orchestration
 // (MANAGED_DIRS) are deleted and re-copied from the kit, so files removed from the kit disappear
-// too. runs/ and telemetry/ are never touched. Normally invoked through deploy.ps1 / deploy.sh
+// too. runs/, telemetry/ and overrides/ are user data. Normally invoked through deploy.ps1 / deploy.sh
 // at the repo root, which add the Node version and prompt-freeze checks.
 //
 // See claude/GLOBAL_INSTALL.md for the manual, step-by-step equivalent.
@@ -20,6 +20,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveCodexBin } from "./scripts/exec-backend.mjs";
+import { upsertBlock, removeBlock, ManagedBlockError } from "./scripts/managed-block.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const KIT = path.resolve(HERE, "..", "..");
@@ -28,10 +29,8 @@ const DEST = path.join(CLAUDE_HOME, "orchestration");
 const AGENTS_DIR = path.join(CLAUDE_HOME, "agents");
 const CLAUDE_MD = path.join(CLAUDE_HOME, "CLAUDE.md");
 const SETTINGS = path.join(CLAUDE_HOME, "settings.json");
-const BEGIN = "<!-- BEGIN frontier-orchestration (managed by frontier_model_orchestration/claude/global/install.mjs) -->";
-const END = "<!-- END frontier-orchestration -->";
 const AGENT_FILES = ["luna-worker.md", "astra-reviewer.md"];
-// Everything under DEST that the kit owns; runs/ and telemetry/ are user data and excluded.
+// The managed kit directories under DEST; runs/, telemetry/ and overrides/ are user data and excluded.
 const MANAGED_DIRS = ["shared", "codex", "claude", "scripts", "templates", "config"];
 
 const args = new Set(process.argv.slice(2));
@@ -122,13 +121,17 @@ function configuredModels(check) {
 }
 
 function install() {
-  act(`remove previously installed kit files -> ${DEST}/{${MANAGED_DIRS.join(",")}} (runs/ and telemetry/ kept)`, () => {
+  // Plan the CLAUDE.md change first: malformed markers must stop the install before anything is touched.
+  const current = fs.existsSync(CLAUDE_MD) ? fs.readFileSync(CLAUDE_MD, "utf8") : "";
+  const claudeMd = upsertBlock(current, "claude-md", "@~/.claude/orchestration/claude/CLAUDE.orchestration.md");
+  act(`remove previously installed kit files -> ${DEST}/{${MANAGED_DIRS.join(",")}} (runs/, telemetry/ and overrides/ kept)`, () => {
     for (const dir of MANAGED_DIRS) fs.rmSync(path.join(DEST, dir), { recursive: true, force: true });
   });
   act(`copy kit docs -> ${DEST}/{shared,codex,claude}`, () => {
     copyDir(path.join(KIT, "shared"), path.join(DEST, "shared"));
     copyDir(path.join(KIT, "codex"), path.join(DEST, "codex"));
     copyDir(path.join(KIT, "claude"), path.join(DEST, "claude"), (e) => e.isFile() && e.name.endsWith(".md"));
+    fs.copyFileSync(path.join(HERE, "CLAUDE.orchestration.md"), path.join(DEST, "claude", "CLAUDE.orchestration.md"));
   });
   act(`copy wrapper + templates + model config -> ${DEST}/{scripts,templates,config}`, () => {
     copyDir(path.join(HERE, "scripts"), path.join(DEST, "scripts"));
@@ -137,6 +140,7 @@ function install() {
     copyDir(path.join(HERE, "config"), path.join(DEST, "config"), (e) => e.isFile() && e.name.endsWith(".json"));
     fs.mkdirSync(path.join(DEST, "runs"), { recursive: true });
     fs.mkdirSync(path.join(DEST, "telemetry"), { recursive: true });
+    fs.mkdirSync(path.join(DEST, "overrides"), { recursive: true });
   });
   act(`copy agents -> ${AGENTS_DIR} (${AGENT_FILES.join(", ")})`, () => {
     fs.mkdirSync(AGENTS_DIR, { recursive: true });
@@ -147,22 +151,21 @@ function install() {
       fs.copyFileSync(src, dst);
     }
   });
-  act(`add/replace managed block in ${CLAUDE_MD}`, () => {
-    const block = `${BEGIN}\n${fs.readFileSync(path.join(HERE, "CLAUDE.orchestration.md"), "utf8").trim()}\n${END}`;
-    const current = fs.existsSync(CLAUDE_MD) ? fs.readFileSync(CLAUDE_MD, "utf8") : "";
+  act(`${claudeMd.changed ? "add/replace" : "keep (unchanged)"} managed block in ${CLAUDE_MD}`, () => {
+    if (!claudeMd.changed) return;
     backup(CLAUDE_MD);
-    const pattern = new RegExp(`${escape(BEGIN)}[\\s\\S]*?${escape(END)}`);
-    const next = pattern.test(current) ? current.replace(pattern, block) : `${current.trimEnd()}${current.trim() ? "\n\n" : ""}${block}\n`;
-    fs.writeFileSync(CLAUDE_MD, next);
+    fs.writeFileSync(CLAUDE_MD, claudeMd.text);
   });
   act(`merge permissions into ${SETTINGS}`, () => {
     const fragment = readJson(path.join(HERE, "settings.permissions.json")).permissions;
     const settings = readJson(SETTINGS);
-    backup(SETTINGS);
+    const before = JSON.stringify(settings);
     settings.permissions ??= {};
     for (const key of ["allow", "ask"]) {
       settings.permissions[key] = [...new Set([...(settings.permissions[key] ?? []), ...fragment[key]])];
     }
+    if (before === JSON.stringify(settings)) return;
+    backup(SETTINGS);
     writeJson(SETTINGS, settings);
   });
   act(`record deployed kit version -> ${path.join(DEST, "deployed.json")}`, () => {
@@ -196,48 +199,57 @@ function deploymentRecord() {
 function uninstall() {
   act(`remove managed block from ${CLAUDE_MD}`, () => {
     if (!fs.existsSync(CLAUDE_MD)) return;
+    const current = fs.readFileSync(CLAUDE_MD, "utf8");
+    const { text: next, changed } = removeBlock(current, "claude-md");
+    if (!changed) return;
     backup(CLAUDE_MD);
-    const pattern = new RegExp(`\\n*${escape(BEGIN)}[\\s\\S]*?${escape(END)}\\n?`);
-    fs.writeFileSync(CLAUDE_MD, fs.readFileSync(CLAUDE_MD, "utf8").replace(pattern, "\n"));
+    fs.writeFileSync(CLAUDE_MD, next);
   });
   act(`remove permissions added by this kit from ${SETTINGS}`, () => {
     if (!fs.existsSync(SETTINGS)) return;
     const fragment = readJson(path.join(HERE, "settings.permissions.json")).permissions;
     const settings = readJson(SETTINGS);
-    backup(SETTINGS);
+    const before = JSON.stringify(settings);
     for (const key of ["allow", "ask"]) {
       if (!settings.permissions?.[key]) continue;
       settings.permissions[key] = settings.permissions[key].filter((r) => !fragment[key].includes(r));
       if (settings.permissions[key].length === 0) delete settings.permissions[key];
     }
     if (settings.permissions && Object.keys(settings.permissions).length === 0) delete settings.permissions;
+    if (before === JSON.stringify(settings)) return;
+    backup(SETTINGS);
     writeJson(SETTINGS, settings);
   });
   act(`remove agents ${AGENT_FILES.join(", ")}`, () => {
     for (const name of AGENT_FILES) fs.rmSync(path.join(AGENTS_DIR, name), { force: true });
   });
   if (args.has("--purge")) {
-    act(`remove ${DEST} (run and telemetry data included)`, () => fs.rmSync(DEST, { recursive: true, force: true }));
+    act(`remove ${DEST} (runs, telemetry and overrides included)`, () => fs.rmSync(DEST, { recursive: true, force: true }));
   } else {
-    act(`remove ${DEST} except runs/ and telemetry/ (pass --purge to delete them)`, () => {
+    act(`remove ${DEST} except runs/, telemetry/ and overrides/ (pass --purge to delete them)`, () => {
       if (!fs.existsSync(DEST)) return;
       for (const entry of fs.readdirSync(DEST)) {
-        if (!["runs", "telemetry"].includes(entry)) fs.rmSync(path.join(DEST, entry), { recursive: true, force: true });
+        if (!["runs", "telemetry", "overrides"].includes(entry)) fs.rmSync(path.join(DEST, entry), { recursive: true, force: true });
       }
     });
   }
 }
 
-function escape(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-if (args.has("--uninstall")) {
-  uninstall();
-} else {
-  const ok = preflight();
-  if (args.has("--check")) process.exit(ok ? 0 : 1);
-  if (!ok) console.log("Preflight has failures; installing anyway. Fix them before delegating (see claude/GLOBAL_INSTALL.md).");
-  install();
-  console.log("Done. Start a NEW Claude Code session so the agents and CLAUDE.md block load.");
+try {
+  if (args.has("--uninstall")) {
+    uninstall();
+  } else {
+    const ok = preflight();
+    if (args.has("--check")) process.exit(ok ? 0 : 1);
+    if (!ok) console.log("Preflight has failures; installing anyway. Fix them before delegating (see claude/GLOBAL_INSTALL.md).");
+    install();
+    console.log("Done. Start a NEW Claude Code session so the agents and CLAUDE.md block load.");
+  }
+} catch (error) {
+  if (error instanceof ManagedBlockError) {
+    console.error(`${CLAUDE_MD}: ${error.problem} at line(s) ${error.lines.join(", ")}`);
+    process.exitCode = 1;
+  } else {
+    throw error;
+  }
 }
