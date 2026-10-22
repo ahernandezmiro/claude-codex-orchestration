@@ -80,34 +80,27 @@ const MODEL_CONFIG_FILES = [
 ];
 const QUOTA_CONFIG_FILE = path.join(KIT_ROOT, "config", "quota.json");
 
-// `worker` is prompt text ("You are <worker>…"), frozen for the evaluation period; it is
-// deliberately independent of the configured model id.
 const ROLES = {
   "luna-implement": {
-    write: true, worker: "GPT-6 Luna",
-    roleDoc: "codex/ROLE_LUNA_IMPLEMENT.md", contract: "task",
+    write: true, defaultPrompt: "implement.md", contract: "task",
     required: ["id", "objective", "editable_paths", "acceptance_criteria"]
   },
   "luna-test": {
-    write: true, worker: "GPT-6 Luna",
-    roleDoc: "codex/ROLE_LUNA_TEST.md", contract: "task",
+    write: true, defaultPrompt: "luna-test.md", contract: "task",
     required: ["id", "objective", "acceptance_criteria"]
   },
   "sol-implement": {
-    write: true, worker: "GPT-6 Sol",
-    roleDoc: "codex/ROLE_LUNA_IMPLEMENT.md", contract: "task",
+    write: true, defaultPrompt: "implement.md", contract: "task",
     required: ["id", "objective", "editable_paths", "acceptance_criteria"]
   },
   "astra-review": {
-    write: false, worker: "GPT-6 Astra",
-    roleDoc: "codex/ROLE_ASTRA_REVIEW.md", contract: "review",
+    write: false, defaultPrompt: "astra-review.md", contract: "review",
     required: ["id", "requirements", "artifact"],
     // Blind review: anything outside these keys (rationale, reasoning, discussion...) is stripped.
     allowed: ["id", "role", "requirements", "constraints", "context", "artifact", "focus", "out_of_scope"]
   },
   "astra-investigate": {
-    write: false, worker: "GPT-6 Astra",
-    roleDoc: "codex/ROLE_ASTRA_INVESTIGATE.md", contract: "result",
+    write: false, defaultPrompt: "astra-investigate.md", contract: "result",
     required: ["id", "objective"]
   }
 };
@@ -275,19 +268,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function section(markdown, heading) {
-  const lines = markdown.split(/\r?\n/);
-  const start = lines.findIndex((l) => l.trim() === heading);
-  if (start < 0) return "";
-  const level = heading.match(/^#+/)[0].length;
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    const m = lines[i].match(/^(#+)\s/);
-    if (m && m[1].length <= level) { end = i; break; }
-  }
-  return lines.slice(start, end).join("\n").trim();
-}
-
 // Locate codex-companion.mjs from the installed OpenAI codex-plugin-cc.
 function findCompanion({ quiet = false } = {}) {
   if (process.env.CODEX_COMPANION && fs.existsSync(process.env.CODEX_COMPANION)) {
@@ -421,29 +401,16 @@ function verifyGit(baseline, { quiet = false, worktree = null } = {}) {
   return { ok: false, changed, now };
 }
 
-function buildPrompt(roleName, role, packetText) {
-  const agents = readKitFile("codex/AGENTS.md");
+function buildPrompt(roleName, role, packetText, rolePrompt) {
   const parts = [
-    `You are ${role.worker}, acting in the \`${roleName}\` role of a multi-model orchestration.`,
-    "Claude Opus is the orchestrator and owns final decisions. You are subordinate to the task packet below.",
-    section(agents, "## Global safety / scope rules"),
-    "Git is off-limits beyond read-only inspection: never run git commit, push, merge, rebase, reset, checkout of other branches, tag, stash, remote, or any history rewrite. The orchestrator verifies git state after you finish.",
-    readKitFile(role.roleDoc)
-  ];
-  if (role.contract === "task") {
-    const contract = readKitFile("shared/TASK_CONTRACT.md");
-    parts.push(section(contract, "## Rules"), section(contract, "## Completion report"));
-  } else if (role.contract === "review") {
-    parts.push(readKitFile("shared/REVIEW_CONTRACT.md"), readKitFile("shared/CREATIVE_PIPELINE_RULES.md"));
-  } else {
-    parts.push(readKitFile("codex/RESULT_CONTRACT.md"));
-  }
-  parts.push(
+    readKitFile("codex/prompts/base.md"),
+    rolePrompt,
+    readKitFile(`codex/prompts/contracts/${role.contract}.md`),
     "## Task packet",
     "```yaml\n" + packetText.trim() + "\n```",
-    "Finish with the YAML report required by your contract as the last thing in your reply."
-  );
-  return parts.filter(Boolean).join("\n\n") + "\n";
+    "Finish with the YAML report above as the last thing in your reply."
+  ];
+  return parts.join("\n\n") + "\n";
 }
 
 function mirror(text, stream = process.stdout) {
@@ -669,7 +636,7 @@ async function cmdRun(options) {
   const stderrFile = `${base}.stderr.txt`;
   const baselineFile = `${base}.git-baseline.json`;
   const runFile = runJsonPath(base);
-  fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText));
+  fs.writeFileSync(promptFile, buildPrompt(roleName, role, packetText, readKitFile(`codex/prompts/roles/${role.defaultPrompt}`)));
   const promptSha256 = crypto.createHash("sha256").update(fs.readFileSync(promptFile)).digest("hex");
 
   let worktree = null;

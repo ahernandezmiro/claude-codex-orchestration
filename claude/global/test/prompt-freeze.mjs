@@ -47,12 +47,16 @@ function staticPromptFiles() {
   const list = (dir, accept) => fs.readdirSync(path.join(REPO, dir))
     .filter(accept)
     .map((name) => `${dir}/${name}`);
+  const recursiveList = (dir) => fs.readdirSync(path.join(REPO, dir), { withFileTypes: true })
+    .flatMap((entry) => entry.isDirectory() ? recursiveList(`${dir}/${entry.name}`) : [entry.name.endsWith(".md") ? `${dir}/${entry.name}` : null])
+    .filter(Boolean);
   return [
     "claude/CLAUDE.md",
     ...list("claude", (n) => /^ROLE_.*\.md$/.test(n)),
     "claude/global/CLAUDE.orchestration.md",
     ...list("claude/global/agents", (n) => n.endsWith(".md")),
     ...list("codex", (n) => n.endsWith(".md")),
+    ...recursiveList("codex/prompts"),
     "shared/ROUTING_POLICY.md",
     "shared/TASK_CONTRACT.md",
     "shared/REVIEW_CONTRACT.md",
@@ -106,14 +110,20 @@ function stageInstalledLayout() {
  * Input: staged layout, role case. Output: prompt text, or throws with wrapper output.
  */
 function generateWorkerPrompt({ stage, companion, sentinel }, { role, packet }) {
-  const r = spawnSync(process.execPath, [
-    path.join(stage, "scripts", "codex-delegate.mjs"), "run",
-    "--role", role, "--packet", path.join(HERE, packet), "--cwd", stage, "--dry-run"
-  ], { encoding: "utf8", env: { ...process.env, ORCH_BACKEND: "companion", CODEX_BIN: sentinel, CODEX_COMPANION: companion } });
-  if (r.status !== 0) throw new Error(`dry run failed for ${role} (exit ${r.status}):\n${r.stdout}${r.stderr}`);
-  const promptLine = r.stdout.split(/\r?\n/).find((l) => l.startsWith("DELEGATE: prompt="));
-  if (!promptLine) throw new Error(`no prompt path reported for ${role}:\n${r.stdout}`);
-  return fs.readFileSync(promptLine.slice("DELEGATE: prompt=".length).trim(), "utf8");
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "prompt-freeze-home-"));
+  // A real user override must never leak into a golden, so the wrapper sees an empty home.
+  try {
+    const r = spawnSync(process.execPath, [
+      path.join(stage, "scripts", "codex-delegate.mjs"), "run",
+      "--role", role, "--packet", path.join(HERE, packet), "--cwd", stage, "--dry-run"
+    ], { encoding: "utf8", env: { ...process.env, HOME: isolatedHome, USERPROFILE: isolatedHome, APPDATA: isolatedHome, ORCH_BACKEND: "companion", CODEX_BIN: sentinel, CODEX_COMPANION: companion } });
+    if (r.status !== 0) throw new Error(`dry run failed for ${role} (exit ${r.status}):\n${r.stdout}${r.stderr}`);
+    const promptLine = r.stdout.split(/\r?\n/).find((l) => l.startsWith("DELEGATE: prompt="));
+    if (!promptLine) throw new Error(`no prompt path reported for ${role}:\n${r.stdout}`);
+    return fs.readFileSync(promptLine.slice("DELEGATE: prompt=".length).trim(), "utf8");
+  } finally {
+    fs.rmSync(isolatedHome, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -141,7 +151,11 @@ function main() {
     for (const workerCase of WORKER_CASES) {
       const prompt = generateWorkerPrompt(staged, workerCase);
       const golden = path.join(GOLDEN_DIR, `${workerCase.role}.golden.md`);
-      if (UPDATE) fs.writeFileSync(golden, prompt);
+      if (UPDATE) {
+        const oldBytes = fs.existsSync(golden) ? fs.statSync(golden).size : 0;
+        fs.writeFileSync(golden, prompt);
+        console.log(`${workerCase.role}: ${oldBytes} -> ${Buffer.byteLength(prompt, "utf8")}`);
+      }
       else if (!fs.existsSync(golden)) problems.push(`${workerCase.role}: golden prompt missing (run --update on the baseline)`);
       else if (fs.readFileSync(golden, "utf8") !== prompt) {
         problems.push(`${workerCase.role} worker prompt changed — ${firstDifference(fs.readFileSync(golden, "utf8"), prompt)}`);
