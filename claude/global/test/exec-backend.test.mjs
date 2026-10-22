@@ -248,8 +248,12 @@ test("cancel immediately after submit prevents Codex from starting", async (t) =
 test("runner loss is detected and reconciliation stops the surviving child", async (t) => {
   const f = makeFixture(t, "sleep");
   await start(f);
+  // The runner records child_pid in a second state write right after spawning; under load the
+  // state can still read `running` without it, so wait for it before killing the runner.
+  const deadline = Date.now() + 5000;
+  while (!stateOf(f.jobDir).child_pid && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
   const running = stateOf(f.jobDir);
-  assert.ok(running.child_pid);
+  assert.ok(running.child_pid, "runner recorded the child pid");
   process.kill(running.runner_pid, "SIGKILL");
   // Poll like the wrapper does: on POSIX the killed runner is a zombie (still signalable) until
   // this process's event loop lets libuv reap it, so a synchronous readJob would still see it alive.
